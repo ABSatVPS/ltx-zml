@@ -1,0 +1,67 @@
+diff --git a/pjrt/pjrt.zig b/pjrt/pjrt.zig
+index 196413d..571a588 100644
+--- a/pjrt/pjrt.zig
++++ b/pjrt/pjrt.zig
+@@ -478,7 +478,10 @@ pub const Client = opaque {
+         buffer_type: BufferType,
+         dims: []const i64,
+         byte_strides: ?[]const i64,
+-        layout: MemoryLayout,
++        /// null lets the plugin pick its default device layout — required for
++        /// sub-byte element types (u4/u2), whose packed layouts cannot be
++        /// expressed here.
++        layout: ?MemoryLayout,
+         host_buffer_semantics: HostBufferSemantics,
+         dst: union(enum) {
+             device: *const Device,
+@@ -495,7 +498,7 @@ pub const Client = opaque {
+             .num_dims = args.dims.len,
+             .byte_strides = if (args.byte_strides) |bs| @ptrCast(@constCast(bs)) else null,
+             .num_byte_strides = if (args.byte_strides) |bs| bs.len else 0,
+-            .device_layout = @ptrCast(@constCast(&args.layout.toCStruct())),
++            .device_layout = if (args.layout) |l| @ptrCast(@constCast(&l.toCStruct())) else null,
+             .host_buffer_semantics = @intFromEnum(args.host_buffer_semantics),
+             .device = if (args.dst == .device) @ptrCast(@constCast(args.dst.device)) else null,
+             .memory = if (args.dst == .memory) args.dst.memory.inner() else null,
+diff --git a/zml/buffer.zig b/zml/buffer.zig
+index 4e9ca6d..1127556 100644
+--- a/zml/buffer.zig
++++ b/zml/buffer.zig
+@@ -119,24 +119,33 @@ pub const Buffer = struct {
+         };
+ 
+         stdx.debug.assert(platform.devices[0].memory(opts.memory) != null, "Device doesn't have {} memory", .{opts.memory});
+-        const slice = Slice.init(sh, data_);
+         const buffer_type = pjrtx.bufferTypeFromDtype(sh.dtype());
+ 
+         const placement = placementOrPanic(res._sharding, sh);
+         const shard_dims: []const i64 = placement.shape.dims();
++
++        // Sub-byte element types (u4/u2): host data is UNPACKED (one element
++        // per byte, low bits), strides cannot be expressed in bytes, and the
++        // device layout must come from the plugin (null → its packed default,
++        // 4/2 bits per element; the transfer packs). Replicated sharding only.
++        const sub_byte = sh.dtype().bitSizeOf() < 8;
++        const maybe_slice: ?Slice = if (sub_byte) null else Slice.init(sh, data_);
++        if (sub_byte) {
++            stdx.debug.assert(data_.len == sh.count(), "Sub-byte host buffer must be one element per byte: expected {} bytes, got {}", .{ sh.count(), data_.len });
++        }
+         const layout = platform.defaultMemoryLayout(shard_dims, sh.dtype());
+ 
+         for (platform.physical_mesh.devices_in_canonical_order) |device| {
+             const memory = platform.devices[device.id].memory(opts.memory).?;
+             const args: pjrt.Client.BufferFromHostBufferArgs = .{
+                 // Change for each device
+-                .data = placement.shardPtr(device.coords, slice),
++                .data = if (maybe_slice) |slice| placement.shardPtr(device.coords, slice) else data_.ptr,
+                 .dst = .{ .memory = memory.pjrt_memory },
+                 // Constant across devices
+-                .layout = layout,
++                .layout = if (sub_byte) null else layout,
+                 .dims = shard_dims,
+                 .buffer_type = buffer_type,
+-                .byte_strides = slice.byte_strides.constSlice(),
++                .byte_strides = if (maybe_slice) |slice| slice.byte_strides.constSlice() else null,
+                 .host_buffer_semantics = .ImmutableUntilTransferCompletes,
+             };
+ 

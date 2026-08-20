@@ -1,0 +1,90 @@
+load("@rules_cc//cc:cc_library.bzl", "cc_library")
+load("@rules_zig//zig:defs.bzl", "zig_binary")
+
+zig_binary(
+    name = "smoke",
+    main = "smoke.zig",
+    srcs = ["backend.zig"],
+    visibility = ["//visibility:public"],
+    deps = [
+        "//zml",
+    ],
+)
+
+# Upstream's conformance test (tests/test_backend_cuda.cc is a copy of
+# colibri's c/tests/test_backend_cuda.cu — pure host C++ — with its main
+# renamed to coli_test_main), linked against the Zig ABI in place of
+# backend_cuda.o.
+cc_library(
+    name = "conformance_cc",
+    srcs = ["tests/test_backend_cuda.cc"],
+    hdrs = ["backend_cuda.h"],
+    tags = ["manual"],
+)
+
+zig_binary(
+    name = "conformance",
+    main = "conformance_main.zig",
+    srcs = [
+        "abi.zig",
+        "backend.zig",
+    ],
+    visibility = ["//visibility:public"],
+    deps = [
+        ":conformance_cc",
+        "//zml",
+    ],
+)
+
+# The colibri engine itself (engine/ is a copy of upstream c/, one line
+# changed: main -> coli_engine_main), linked against the Zig backend.
+# OpenMP is off (pragmas ignored): single-threaded CPU side, fine for the
+# bench fixture.
+cc_library(
+    name = "engine_cc",
+    # Headers stay PRIVATE (srcs, not hdrs): the Zig side only calls one
+    # extern fn, and exporting these breaks rules_zig's translate-c step.
+    srcs = ["engine/colibri.c"] + glob(
+        ["engine/*.h"],
+        exclude = [
+            "engine/backend_gpu_compat.h",
+            "engine/backend_metal.h",
+            "engine/backend_cuda_ink.h",
+        ],
+    ),
+    copts = [
+        "-O2",
+        "-march=native",
+        "-w",
+        "-D_FILE_OFFSET_BITS=64",
+        "-DCOLI_CUDA",
+        # OpenMP via the SYSTEM toolchain's header + runtime (the hermetic
+        # clang ships no omp.h/libomp): non-hermetic on purpose, this build
+        # is an experiment vehicle.
+        "-fopenmp",
+    ],
+    includes = ["engine"],
+    linkopts = [
+        "-lm",
+        "-L/usr/lib64",
+        "-lomp",
+        # System libomp references newer glibc symbol versions than the
+        # hermetic link sysroot knows; they resolve at runtime on this host.
+        "-Wl,--allow-shlib-undefined",
+    ],
+    tags = ["manual"],
+)
+
+zig_binary(
+    name = "coli",
+    main = "engine_main.zig",
+    srcs = [
+        "abi.zig",
+        "backend.zig",
+    ],
+    visibility = ["//visibility:public"],
+    deps = [
+        ":engine_cc",
+        "//zml",
+    ],
+)

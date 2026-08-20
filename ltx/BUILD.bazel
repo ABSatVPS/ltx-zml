@@ -1,0 +1,12 @@
+load("@rules_zig//zig:defs.bzl", "zig_binary")
+
+# E1..E4 smoke benchmarks: the compiler-behavior unknowns, measured before
+# any engine code exists. See docs/lab-notebook.md for the hypotheses.
+zig_binary(
+    name = "smoke",
+    main = "smoke.zig",
+    visibility = ["//visibility:public"],
+    deps = [
+        "//zml",
+    ],
+)

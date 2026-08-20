@@ -1,0 +1,27 @@
+coli-zml
+Copyright 2026 Adam
+
+Licensed under the Apache License, Version 2.0 (see LICENSE).
+
+This repository contains original work plus patches against two upstream
+projects. Neither project's source code is redistributed here;
+scripts/setup.sh fetches both from their canonical repositories at pinned
+revisions.
+
+  colibrì — https://github.com/JustVugg/colibri
+  Copyright the colibrì authors, Apache License 2.0.
+  Its C engine, GPU backend header, and GPU conformance suite are fetched at
+  build time. Two mechanical edits are applied by scripts/setup.sh: the
+  entry points of c/colibri.c and c/tests/test_backend_cuda.cu are renamed so
+  that a Zig main can call them, and c/uring.h's Linux guard is widened with
+  __has_include so the file compiles against sysroots that lack the kernel
+  UAPI headers. patches/ holds two further changes, both described in README.md.
+
+  ZML — https://github.com/zml/zml
+  Copyright the ZML authors, Apache License 2.0.
+  Fetched at build time and patched to support sub-byte (u4/u2) device buffer
+  transfers; see patches/zml-pjrt-subbyte-transfer.patch.
+
+The quantization formats implemented in coli/backend.zig follow the codecs
+defined in colibrì's c/quant.h, which is the normative definition of its
+on-disk weight encodings.

@@ -1,0 +1,54 @@
+diff --git a/c/tests/bench_tensor_core.cu b/c/tests/bench_tensor_core.cu
+index 3666eb4..c8f3b86 100644
+--- a/c/tests/bench_tensor_core.cu
++++ b/c/tests/bench_tensor_core.cu
+@@ -30,16 +30,42 @@ int main(){
+     for(int i=0;i<D;i++)ds[i]=0.006f+(i%7)*0.0002f;
+     for(size_t i=0;i<x.size();i++)x[i]=std::sin((float)(i+1)*0.013f)*2.f;
+     ColiCudaTensor *g=nullptr,*u=nullptr,*d=nullptr;
+-    if(!coli_cuda_tensor_upload(&g,hidden.data(),hs.data(),2,D,I,device,0)||
+-       !coli_cuda_tensor_upload(&u,hidden.data(),hs.data(),2,D,I,device,0)||
+-       !coli_cuda_tensor_upload(&d,down.data(),ds.data(),2,I,D,device,0))return 2;
++    if(!coli_cuda_tensor_upload_g(&g,hidden.data(),hs.data(),2,D,I,device,0)||
++       !coli_cuda_tensor_upload_g(&u,hidden.data(),hs.data(),2,D,I,device,0)||
++       !coli_cuda_tensor_upload_g(&d,down.data(),ds.data(),2,I,D,device,0))return 2;
+     for(int rows: {1,2,4,8}){
+-        double scalar=run(g,u,d,x.data(),a.data(),rows,3,0);
+-        double packed=run(g,u,d,x.data(),b.data(),rows,3,1);
+-        double tc=run(g,u,d,x.data(),c.data(),rows,3,2);
++        double scalar=run(g,u,d,x.data(),a.data(),rows,100,0);
++        double packed=run(g,u,d,x.data(),b.data(),rows,100,1);
++        double tc=run(g,u,d,x.data(),c.data(),rows,100,2);
+         double pe=0,te=0,ref=0;for(int i=0;i<rows*D;i++){double p=b[i]-a[i],t=c[i]-a[i];pe+=p*p;te+=t*t;ref+=(double)a[i]*a[i];}
+         std::printf("rows=%d scalar_ms=%.3f packed_ms=%.3f packed_speedup=%.3fx packed_rms=%.7f tensor_ms=%.3f tensor_speedup=%.3fx tensor_rms=%.5f\n",
+                     rows,scalar,packed,scalar/packed,std::sqrt(pe/(ref+1e-20)),tc,scalar/tc,std::sqrt(te/(ref+1e-20)));
+     }
+-    coli_cuda_tensor_free(g);coli_cuda_tensor_free(u);coli_cuda_tensor_free(d);coli_cuda_shutdown();
++    coli_cuda_tensor_free(g);coli_cuda_tensor_free(u);coli_cuda_tensor_free(d);
++
++    /* Decode-unit case: count=8 DISTINCT experts, 1 row each (matches the
++     * ZML fused-group bench). */
++    ColiCudaTensor *g8[8],*u8[8],*d8[8]; int rs8[8];
++    for(int e=0;e<8;e++){
++        for(size_t i=0;i<hidden.size();i++)hidden[i]=(unsigned char)((i*17+29+e*7)&255);
++        for(size_t i=0;i<down.size();i++)down[i]=(unsigned char)((i*13+41+e*11)&255);
++        g8[e]=u8[e]=d8[e]=nullptr; rs8[e]=1;
++        if(!coli_cuda_tensor_upload_g(&g8[e],hidden.data(),hs.data(),2,D,I,device,0)||
++           !coli_cuda_tensor_upload_g(&u8[e],hidden.data(),hs.data(),2,D,I,device,0)||
++           !coli_cuda_tensor_upload_g(&d8[e],down.data(),ds.data(),2,I,D,device,0))return 2;
++    }
++    setenv("COLI_CUDA_W4_PACKED","1",1);
++    unsetenv("COLI_CUDA_TC_INT4"); /* leftover from mode=2 selects the HIP no-op WMMA kernel (BUG-002) */
++    if(!coli_cuda_expert_group(g8,u8,d8,rs8,8,a.data(),x.data()))return 2;
++    /* validate against 8 independent count=1 calls (packed path, verified above) */
++    for(int e=0;e<8;e++)
++        if(!coli_cuda_expert_group(&g8[e],&u8[e],&d8[e],rs8,1,b.data()+(size_t)e*D,x.data()+(size_t)e*D))return 2;
++    {double err=0,ref=0;for(int i=0;i<8*D;i++){double dd=a[i]-b[i];err+=dd*dd;ref+=(double)b[i]*b[i];}
++     if(std::sqrt(err/(ref+1e-20))>1e-5){std::printf("group8x1 MISMATCH rms=%.6f\n",std::sqrt(err/(ref+1e-20)));return 2;}}
++    auto gb=std::chrono::steady_clock::now();
++    for(int it=0;it<100;it++)if(!coli_cuda_expert_group(g8,u8,d8,rs8,8,a.data(),x.data()))return 2;
++    auto ge=std::chrono::steady_clock::now();
++    std::printf("group8x1 packed_ms=%.3f\n",std::chrono::duration<double,std::milli>(ge-gb).count()/100);
++    for(int e=0;e<8;e++){coli_cuda_tensor_free(g8[e]);coli_cuda_tensor_free(u8[e]);coli_cuda_tensor_free(d8[e]);}
++    coli_cuda_shutdown();
+ }

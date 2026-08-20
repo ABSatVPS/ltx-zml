@@ -1,0 +1,6 @@
+.work/
+bazel-*
+.zig-cache/
+zig-out/
+*.o
+*.so

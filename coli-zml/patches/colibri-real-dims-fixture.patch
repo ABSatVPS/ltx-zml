@@ -1,0 +1,16 @@
+31,35c31,35
+<         hidden_size=1024,
+<         intermediate_size=2048,
+<         moe_intermediate_size=512,
+<         num_hidden_layers=8,
+<         first_k_dense_replace=3,
+---
+>         hidden_size=6144,
+>         intermediate_size=4096,
+>         moe_intermediate_size=2048,
+>         num_hidden_layers=3,
+>         first_k_dense_replace=1,
+38c38
+<         n_routed_experts=32,
+---
+>         n_routed_experts=16,

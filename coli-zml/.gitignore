@@ -1,0 +1,11 @@
+# Upstream checkouts + bazelisk, recreated by scripts/setup.sh
+.work/
+
+# Model fixtures (gigabytes; regenerate with docs/reproduce.md)
+models/
+*.safetensors
+bench_stats.txt
+.coli_usage
+
+# Build output
+bazel-*
