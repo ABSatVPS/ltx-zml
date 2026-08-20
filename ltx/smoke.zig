@@ -103,6 +103,15 @@ fn dotQF16Graph(w: zml.Tensor, sc: zml.Tensor, x: zml.Tensor) zml.Tensor {
     return x.dot(dequant(w, sc).convert(.f16), .i);
 }
 
+/// E1b scalar-sum twin: same compute as dotQF16Graph, 4-byte download.
+/// Run 4 found the E1b-vs-E1a gap was a constant ~0.5 GB/s at every S —
+/// i.e. the full-output D2H readback, not the GEMM. This variant is the
+/// controlled test: if it matches E1a's scalar variant, the quantized
+/// GEMM was never slow and toSliceAlloc readback was the whole story.
+fn dotQF16SumGraph(w: zml.Tensor, sc: zml.Tensor, x: zml.Tensor) zml.Tensor {
+    return x.dot(dequant(w, sc).convert(.f16), .i).convert(.f32).sum(.o).squeeze(.o).sum(.s).squeeze(.s);
+}
+
 /// E2: ZML's own sdpa — a NAIVE trace (scores materialize at graph level).
 /// Whether XLA's fusion rescues it is exactly the experiment.
 fn sdpaGraph(q: zml.Tensor, k: zml.Tensor, v: zml.Tensor) zml.Tensor {
@@ -269,25 +278,29 @@ pub fn main(init: std.process.Init) !void {
     }
 
     // ---- E1b: int4-resident dequant->f16 dot (the engine candidate) -------
-    log.info("E1b: int4 resident, dequant traced to f16, real dot (full f16 output download)", .{});
+    // The 2x2: {dense, quant} x {scalar-sum, full download}, separating
+    // GEMM compute from D2H readback (run 4's suspect at ~0.5 GB/s).
+    log.info("E1b: {{dense,int4-resident}} x {{scalar-sum,full-download}} at f16", .{});
     for ([_]i64{ 512, 4096, 28672 }) |s| {
         const su: usize = @intCast(s);
         const x16_spec: zml.Tensor = .init(.{ .s = s, .i = K }, .f16);
         const x16_shape: zml.Shape = .init(.{ .s = s, .i = K }, .f16);
         var x16_buf = try uploadF16(io, platform, x16_shape, x16[0 .. su * Ku]);
         defer x16_buf.deinit();
-        var q16_exe = try platform.compileFn(allocator, io, dotQF16Graph, .{ w_spec, sc_spec, x16_spec }, .{});
+        const w16_spec: zml.Tensor = .init(.{ .o = O, .i = K }, .f16);
+        var q_full_exe = try platform.compileFn(allocator, io, dotQF16Graph, .{ w_spec, sc_spec, x16_spec }, .{});
+        var q_sum_exe = try platform.compileFn(allocator, io, dotQF16SumGraph, .{ w_spec, sc_spec, x16_spec }, .{});
+        var d_full_exe = try platform.compileFn(allocator, io, gemmF16Graph, .{ w16_spec, x16_spec }, .{});
         const out16 = try allocator.alloc(f16, su * Ou);
         defer allocator.free(out16);
-        try callExe(f16, allocator, io, &q16_exe, .{ w_buf, sc_buf, x16_buf }, out16); // warmup
+        const ref16 = try allocator.alloc(f16, su * Ou);
+        defer allocator.free(ref16);
+        var scalar: [1]f32 = undefined;
+        try callExe(f16, allocator, io, &q_full_exe, .{ w_buf, sc_buf, x16_buf }, out16); // warmups
+        try callExe(f32, allocator, io, &q_sum_exe, .{ w_buf, sc_buf, x16_buf }, &scalar);
+        try callExe(f16, allocator, io, &d_full_exe, .{ w16_buf, x16_buf }, ref16);
         if (s == 512) {
-            // Cross-check against the dense f16 GEMM on the CPU-dequantized
-            // copy of the same weights (independent dequant path).
-            const w16_spec: zml.Tensor = .init(.{ .o = O, .i = K }, .f16);
-            var ref_exe = try platform.compileFn(allocator, io, gemmF16Graph, .{ w16_spec, x16_spec }, .{});
-            const ref16 = try allocator.alloc(f16, su * Ou);
-            defer allocator.free(ref16);
-            try callExe(f16, allocator, io, &ref_exe, .{ w16_buf, x16_buf }, ref16);
+            // Cross-check quantized vs dense (independent dequant paths).
             const a32 = try allocator.alloc(f32, su * Ou);
             defer allocator.free(a32);
             const b32 = try allocator.alloc(f32, su * Ou);
@@ -298,9 +311,19 @@ pub fn main(init: std.process.Init) !void {
             log.info("  S=512: dequant->f16 dot matches dense f16 GEMM", .{});
         }
         const reps: usize = if (su <= 4096) 8 else 4;
-        const p50 = try timeExe(f16, allocator, io, &q16_exe, .{ w_buf, sc_buf, x16_buf }, out16, reps);
+        const p50_qs = try timeExe(f32, allocator, io, &q_sum_exe, .{ w_buf, sc_buf, x16_buf }, &scalar, reps);
+        const p50_qf = try timeExe(f16, allocator, io, &q_full_exe, .{ w_buf, sc_buf, x16_buf }, out16, reps);
+        const p50_df = try timeExe(f16, allocator, io, &d_full_exe, .{ w16_buf, x16_buf }, ref16, reps);
         const tflop = 2.0 * @as(f64, @floatFromInt(s * O * K)) / 1e12;
-        log.info("  S={d:>5}: p50 {d:.3}ms -> {d:.2} TFLOP/s (vs E1a dense; gap = cost of staying int4-resident)", .{ @as(u64, @intCast(s)), ms(p50), tflop / (ms(p50) / 1e3) });
+        const dl_bytes = @as(f64, @floatFromInt(su * Ou * 2));
+        log.info("  S={d:>5}: quant-scalar {d:.3}ms ({d:.2} TFLOP/s) | quant-full {d:.3}ms | dense-full {d:.3}ms | implied readback {d:.2} GB/s", .{
+            @as(u64, @intCast(s)),
+            ms(p50_qs),
+            tflop / (ms(p50_qs) / 1e3),
+            ms(p50_qf),
+            ms(p50_df),
+            dl_bytes / (@as(f64, @floatFromInt(p50_qf -| p50_qs)) + 1),
+        });
     }
 
     // ---- E2: sdpa at video lengths (LAST: may OOM at large T) -------------

@@ -173,8 +173,9 @@ E1 through E4 have numbers.
    patch, `ltx/` package installed), `//ltx:smoke` builds and enumerates
    the gfx1200 device. (Done same day — see the run 1 entry below. First
    build: 640 s, 5417 actions, hermetic ROCm userland.)
-2. E1 and E2 measured, ISA dump read.
-3. E3 if E2 demands it (expected).
+2. ✅ E1 and E2 measured, dumps read (runs 1–5, same day — including E1b's
+   three-theory detective story; see the run entries).
+3. ⏳ E3 — E2 demanded it, as expected. Now the critical path.
 4. E4.
 5. One LTX-2.5 transformer block, numerically conformant against the
    HuggingFace implementation as oracle — coli-zml's 32/32 teacher-forcing
@@ -262,8 +263,7 @@ Run 2 (warm build: 11.6 s) reproduced E1 and E1a within noise — crossover
 still between 8 and 64 rows, dot still 2.2–2.5× over qdot at large S, E1a
 peaking at 60.8 TFLOP/s this time — and delivered two new results.
 
-### E1b measured: 3.0 TFLOP/s, flat across S. Hypothesis refuted — but not
-### the way the hypothesis feared
+### E1b measured: 3.0 TFLOP/s flat across S — hypothesis refuted, but not the way it feared
 
 The int4-resident dequant→f16→dot path ran at 3.07 / 3.01 / 3.04 TFLOP/s
 at S=512/4096/28672 — twenty times below E1a's dense-f16 number, nowhere
@@ -308,8 +308,7 @@ dot_general materialization: **on this stack, WHERE a GEMM operand comes
 from can silently cost 20×.** The smoke must keep both E1a and E1b
 forever as the tripwire pair.
 
-### E2 at T=512: the oracle tripped on tolerance, and the HLO already
-### answers the structural question
+### E2 at T=512: the oracle tripped on tolerance, and the HLO already answers the structural question
 
 The sdpa output measured RMS 0.0082 against the f64 CPU oracle, over my
 5e-3 limit — run aborted before any timing. Analysis says the tolerance
@@ -326,3 +325,153 @@ them** plus a softmax fusion. No flash-style rewrite exists on this
 path. Scores at T=28672 are ~26 GB — the prediction stands that E2's top
 size OOMs and E3 (blockwise attention in the traced graph) is mandatory.
 Run 3 measures how far the naive form gets and what it costs.
+
+## 2026-08-20, evening — run 3: E2 answered in full; the E1b prediction FAILS
+
+Run 3 ran with `--xla_gpu_autotune_level=0` to test run 2's prediction,
+and with the E2 oracle tolerance corrected to 2e-2.
+
+### E2 complete: naive attention dies at T=16384, and weakly before that
+
+With the tolerance fixed, T=512 matches the CPU oracle and the sweep
+proceeds: 5.5 ms at T=512, 10.5 ms at T=1024, 37.8 ms at T=4096, 112.6 ms
+at T=8192 — throughput climbing only to 4.9 TFLOP/s, roughly 12× below
+what the card demonstrates on GEMMs, because the naive form is
+bandwidth-bound shuttling the scores matrix through VRAM. At T=16384 it
+died: "Out of memory while trying to allocate 16.00GiB." That number is
+its own forensic: 16 heads × 16384² × 4 bytes is exactly 16 GiB — the
+softmax path materializes the scores in **f32**, upcast from the f16
+inputs, doubling the already-fatal footprint. (Caveat noted: run 3 had
+autotuning off, which may depress the absolute ms figures somewhat; the
+structural conclusion is unaffected.)
+
+E2's verdict, cleanly: on the ROCm/XLA path there is no flash-style
+attention rewrite; video-length attention through the naive form fails
+on memory at a quarter of LTX's working sequence length, and is
+bandwidth-crippled even when it fits. **E3 — blockwise online-softmax
+attention written into the traced graph — is now the critical path for
+the whole project**, exactly as the genesis entry hypothesized.
+
+### The E1b prediction failed, and that's the most informative result yet
+
+Prediction was: autotuning off, E1a and E1b converge. Measured: E1a fell
+3× (60.8 → 20.5 TFLOP/s — so autotuning is worth 3× even on the clean
+dense GEMM, its own finding), but E1b stayed at ~2.9 TFLOP/s — still 7×
+behind E1a under supposedly identical default algorithm selection. Two
+byte-identical GEMM configs under one shared heuristic cannot differ 7×,
+so under autotune-off the two calls must not be getting the same
+lowering at all. Revised theory: with autotuning disabled, the
+fusion-fed GEMM doesn't go to hipBLASLt the way the parameter-fed one
+does — plausibly the dequant gets absorbed into an XLA Triton GEMM
+fusion, or the custom-call falls back differently. Run 4 repeats
+autotune-off with the dump enabled and reads what each call actually
+became. Prediction, pre-registered again: the two E1b-vs-E1a modules
+will show structurally different lowerings, not just different algorithm
+numbers.
+
+The practical stakes: the engine wants int4-resident weights feeding
+GEMMs at E1a speed. If fusion-fed GEMMs are unreliable across both
+autotuner settings, the robust design is an explicit two-executable
+split — a dequant executable writing a f16 scratch buffer, and the
+dense GEMM consuming it as a plain parameter — which run 2's HLO shows
+would place ~0.3 ms of dequant against a 12 ms GEMM. That design also
+composes with block streaming: dequant once per block per step, right
+after the block's upload.
+
+## 2026-08-20, night — run 4: theory two dies, and the truth is embarrassing
+
+Run 4 repeated autotune-off with the dump enabled. The revised theory
+("fusion-fed GEMMs get a different lowering") is HALF right and wholly
+beside the point.
+
+Half right: under autotune-off, neither E1a nor E1b goes to hipBLASLt —
+XLA emits its own Triton GEMM for both (so autotuning is what routes
+GEMMs to the 3×-faster hipBLASLt path; without it you get Triton at ~20
+TFLOP/s — a real finding that stands). But the E1b and E1a Triton
+fusions have IDENTICAL block configs — num_warps 4, 32×32 output tiles,
+same everything — and the dequant fusion stays a separate kernel in
+both autotuner modes. Identical kernels cannot differ 7×. Theory dead.
+
+Then the actual answer, hiding in plain sight since run 2. Recompute
+every E1b-minus-E1a delta as a RATE against the bytes E1b downloads and
+E1a doesn't (full f16 output vs 4-byte scalar): run 2 gives 0.56, 0.53,
+0.52 GB/s at S=512/4096/28672; run 4 gives 0.50, 0.53, 0.50. **Six
+measurements, two different GEMM backends, one constant: ~0.5 GB/s.
+The "20× slower quantized GEMM" was never the GEMM — it was
+`toSliceAlloc` device-to-host readback of the full output at half a
+gigabyte per second** (a fresh pageable allocation per call, page
+faults included, through PJRT). The GEMM was almost certainly at full
+speed in every run. The "algorithm 91 vs 73" smoking gun of run 2
+explained timing that this explains better — retracted; whether algo 91
+is actually slower than 73 is UNKNOWN and no longer load-bearing.
+
+This is the same genre of ghost as colibrì's 1.3 TB/s tensor-core
+benchmark — a measurement artifact masquerading as a kernel property —
+and this notebook exists precisely to catch these. The correction:
+compute-side numbers must come from scalar-epilogue variants; full
+downloads must be reported as what they are (readback benchmarks).
+
+**Run 5, prediction pre-registered:** the 2×2 of {dense, int4-resident}
+× {scalar-sum, full-download} at default autotuning. If the readback
+theory is right: quant-scalar lands within ~15% of E1a's dense-scalar
+~60 TFLOP/s (the ORIGINAL E1b hypothesis, resurrected), both
+full-download variants sit ~0.5 GB/s above their scalar twins, and the
+dense-vs-quant full-download gap is small. If quant-scalar is still
+several-fold slow, something real remains after all.
+
+Engine consequences if confirmed: int4-resident weights feeding
+hipBLASLt GEMMs work at full speed with NO two-executable split needed
+(XLA's own dequant-then-BLAS structure is already right); outputs must
+stay on device between pipeline stages (they were always going to);
+and the one place the engine truly downloads — final VAE frames — needs
+pinned host memory or a better readback path than naive toSliceAlloc,
+worth ~0.5 GB/s vs PCIe's ~25.
+
+## 2026-08-20, late night — run 5: confirmed, and the engine path is open
+
+The 2×2 at default autotuning settles it:
+
+At S=4096, quant-scalar hits 42.81 TFLOP/s against dense-scalar's 42.39 —
+**identical within noise**. The int4-resident dequant→f16→hipBLASLt path
+runs at full dense speed; the original E1b hypothesis ("within 15%"),
+refuted in run 2 and buried under two wrong theories, was correct all
+along. And the two full-download variants are indistinguishable from
+each other (260 vs 286 ms at S=28672, dense the slower one this time —
+pure readback noise), both sitting at the predicted ~0.48 GB/s implied
+readback rate. The run-2 "20× quantized penalty" is formally retracted:
+it was toSliceAlloc, start to finish.
+
+One residual, recorded honestly: at S=28672 quant-scalar reads 43.8
+TFLOP/s against dense's 58.9 — a 1.34× gap (4.2 ms) that is far above
+the ~0.3 ms the dequant fusion itself can account for. Hypothesis for a
+future session: this is the algorithm-selection question from run 2
+returning at its true magnitude — the autotuner picking a slightly
+worse hipBLASLt algorithm for the fusion-fed GEMM — worth ~1.3× at the
+largest size, not 20×. Open item, not a blocker.
+
+### Day one's ledger
+
+Established, each with an oracle or a forensic trail: the qdot/dot
+crossover sits between 8 and 64 rows (decode trick stays on the decode
+side); XLA routes large GEMMs to hipBLASLt and reaches ~59 TFLOP/s f16
+on gfx1200 — matrix cores engaged, and autotuning is worth 3× (without
+it, Triton fallback at ~20); int4-resident weights feed those GEMMs at
+full speed with XLA's own dequant-then-BLAS split, no custom
+restructuring needed; naive attention materializes f32 scores and dies
+at T=16384 on 16 GB while running 12× below GEMM efficiency where it
+fits, so E3 (in-graph blockwise attention) is the project's critical
+path; and device-to-host readback via naive toSliceAlloc runs at ~0.5
+GB/s, which poisons benchmarks that download and dictates that the
+engine keep everything on device until the final frames.
+
+Methodology note for the record: three hypotheses died today — E1b's
+15%, the autotuner-instability story, and the different-lowering story
+— and each death was cheap because its prediction was written down
+before the measurement. The one that survived was the boring one. That
+is the notebook working as intended.
+
+Next session: E3 — blockwise online-softmax attention as an explicit
+loop in the traced graph. Target: beat 4.9 TFLOP/s naive at T=8192,
+run at all at T=28672, judged against the same CPU oracle. After that,
+read the LTX-2.5 HF config to pin the real geometry (the 28 k estimate,
+head count, and dual-stream split are still unverified).
