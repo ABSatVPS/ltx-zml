@@ -2364,3 +2364,45 @@ step" is CLOSED at harness T.** What remains of Phase 3's done-means
 is exactly one clause: the pass at production length, fits + runs +
 time-per-step. //ltx:e2e_prod is compiled and pre-registered; running
 it next on the now-quiet machine.
+
+### H-PROD results: it fits, it runs, and the time-per-step exposes a harness constant doing a production job
+
+//ltx:e2e_prod at T=28,672: compile 51.0 s for the 5 executables.
+H-PROD-1 (fits): PASS — no allocation failure, and the velocity is
+finite and sane (nan/inf 0, rms 0.4335, max_abs 4.17). The run:
+PRODUCTION PASS 1340.27 s wall, 27.88 s/block average, reader parks
+46, consumer parks 0.
+
+H-PROD-2's 1.4-1.7 s/block prediction missed by 16-20x, and the park
+counters say where to look: the reader parked 46 times (staging
+FINISHED early and waited on compute, every block), the consumer
+never waited — the pass is thoroughly compute-bound, so the ~60 s of
+staging per pass is fully hidden exactly as predicted, just behind
+20x more compute than predicted. The suspect, anchored by receipts:
+ACHUNK=16 was chosen so the T=64 HARNESS gets 4 while-loop
+iterations ("a single chunk of T would degenerate into plain
+softmax"); at T=28,672 the same constant means 1,792 iterations of
+[H, T, 16]-thin GEMMs — the identical 13.5 TFLOP of attention
+arithmetic pushed through latency-bound slivers. E3's 1.22 s
+attention measurement — the number the prediction leaned on — was
+taken at WCHUNK=1024 (28 iterations) in smoke.zig. The block
+integration inherited the harness constant, and nothing between
+T=64 and T=28,672 ever re-scaled it. (Also relearned, fourth
+costume: `| head -30` on the run's monitor pipeline block-buffered
+every line until process exit — head cannot flush. The run itself
+was safe; the visibility wasn't.)
+
+Pre-registered fix: whileSdpa becomes comptime-chunk-parametric with
+trace-time selection — 1024 when the K length divides by it, 16
+otherwise — so every harness graph (T=64) is BITWISE UNCHANGED (the
+22-gate suite must reproduce its historical numbers) and production
+gets E3's measured geometry. New gate, because chunk 1024 has never
+run inside the full block: e2e_prod grows a pre-pass agreement check
+at T=4096 — wBlockOut's attention path (auto-selecting 1024) vs the
+dense twin (torch-anchored at the harness), block-0 weights, seeded
+inputs, budget 1e-5 per the E3w agreement precedent. H-PROD-2b:
+post-fix, attention returns to ~1.2-1.5 s and the block lands at
+~3-4.5 s (f32 GEMMs at their own rate), putting the step at
+~2.5-4 min. If the block stays slow after the chunk fix, the
+hypothesis is wrong and the next suspect is the f32 GEMM rate
+itself (the 59-77 TFLOP/s anchors are f16 numbers).
