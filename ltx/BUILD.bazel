@@ -98,6 +98,24 @@ zig_binary(
     ],
 )
 
+# H-LOOP-1/2: stage 1's 8 distilled steps — host scheduler marching the
+# latent, per-step velocities from the streamed engine, vs the reference
+# trajectory.
+zig_binary(
+    name = "e2e_denoise",
+    main = "e2e_denoise.zig",
+    srcs = [
+        "block.zig",
+        "core_parts.zig",
+        "loader.zig",
+        "scheduler.zig",
+    ],
+    visibility = ["//visibility:public"],
+    deps = [
+        "//zml",
+    ],
+)
+
 # E-STREAM-3: the streaming ring's three-block dry run (0/23/47).
 zig_binary(
     name = "ring_dryrun",
