@@ -987,3 +987,37 @@ upstream implementation running real block-0 weights. Phase 2 closes
 same-day. Phase 3 — all 48 blocks, quantized residency, the distilled
 scheduler — now has a proven template: this block graph, repeated,
 with the E1b-validated int4 path under it.
+
+## 2026-08-21, later — Phase 3 entry criteria, pre-registered
+
+Review amendments adopted before assembly begins. First, the scope of
+Phase 2's result, stated the way external readers should read it:
+measured conformance for the declared configuration — pinned upstream
+implementation, checkpoint revision, oracle bundle, runtime — not a
+general guarantee across model revisions, compiler versions, hardware,
+or quantized 48-block execution. The qualifier strengthens the claim:
+it makes it reproducible, and it stops Phase 3's changes from
+inheriting a guarantee they haven't earned.
+
+The risk has moved. The transformer block is no longer where semantic
+danger lives; composition boundaries are. In pre-registered priority
+order: int4 dequantization placement, group layout, scales and
+accumulation dtype; cross-block dtype transitions and residual
+accumulation; long-sequence attention masking, traversal order, and
+online-softmax reduction at scale; distilled scheduler timestep
+mapping, prediction parameterization, and latent scaling; and tensor
+residency plus loader behavior under all 48 blocks.
+
+**Phase 3's first checkpoint is NOT a generated clip.** It is a
+three-block chain — blocks 0, 23, and 47, early/middle/late — in
+float32 with the existing stage-walking oracle at every block
+boundary. Only after that passes: int4 introduced one projection
+family at a time, each compared against the f32 block path by
+projection class; then the E3w video-length attention substituted
+after establishing an overlap domain where it and dense attention
+agree (the E3 cross-checks at T ≤ 8192 are the template); then the
+scheduler, compared state-by-state and update-by-update before any
+clip is judged. Every run record freezes the oracle bundle hash,
+model revision, RoPE metadata, and compiler/runtime versions.
+
+Blocks 23 and 47 are fetching as this is written.

@@ -11,7 +11,11 @@ RDNA 4), 16 GB VRAM, Fedora 44.
 numerically conformant** against the upstream implementation on real
 checkpoint weights (rel-RMS 1.85e-6 vs an f64 oracle, RoPE tables
 bit-perfect), on top of all four feasibility experiments (E1–E4)
-answered. Measured on
+answered. Scope stated precisely: this is measured conformance for the
+declared configuration — pinned upstream implementation, checkpoint
+revision, oracle bundle, and runtime — not a general guarantee across
+model revisions, compiler versions, hardware, or the quantized
+48-block execution that Phase 3 must earn separately. Measured on
 the target card: XLA routes large f16 GEMMs to hipBLASLt and reaches
 ~59 TFLOP/s on gfx1200 (matrix cores engaged; autotuning is worth 3×);
 int4-resident weights with in-graph dequant feed those GEMMs at full
