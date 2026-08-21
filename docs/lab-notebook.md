@@ -902,3 +902,43 @@ revision) — no format conversions that can silently alter values. The
 fetcher pins the HF revision by commit hash, validates
 non-overlapping expected ranges before writing, and records SHA-256
 plus first/last elements per tensor.
+
+## 2026-08-21, late — Phase 2 build session 1: the oracle side is done
+
+The pre-registered protocol executed without a surprise, which after
+this week feels like a result in itself.
+
+Weights: `tools/fetch_block.py` pulled block 0's 28 video-stream
+tensors (513 MB) by revision-pinned range request — non-overlap and
+exact-size validation before any byte landed, SHA-256 per tensor,
+first/last elements logged and all at plausible weight scale. No
+byte-shift, no transposition surprises at the container level.
+
+Oracle: `tools/make_oracle_bundle.py` runs the UPSTREAM block — real
+ltx-core code, real weights, torch CPU in f64 — and dumps the staged
+composition in exactly the pre-registered order: modulated norm,
+q-norm probe, gate-bypassed attention (via the reference's own ops
+plumbing, no monkey-patching), gated attention, post-SA residual and
+fresh norm, cross-attention contribution, FFN input and output, block
+output. RoPE tables go through the reference's f64 numpy path and are
+cast once to f32 — the runtime contract — with the full generation
+metadata persisted beside them. The indices grid leads with the probe
+rows: eight tokens with only t active (endpoints included), eight for
+h, eight for w, then a deterministic mesh.
+
+Two verification results worth their ink. First, the staged
+decomposition reproduces the block's real `forward` at **max abs diff
+0.00e+00 in f64** — the staging is the reference, not an
+approximation of it, so a stage-level mismatch on our side indicts our
+code and nothing else. Second, the calibration gift: the reference
+run in its own bf16 deployment dtype lands at **rel-RMS 0.00592**
+from its f64 self. The pre-registered full-block tolerance of 1e-2
+now has a measured meaning — a ZML bf16 block near 6e-3 is
+numerically indistinguishable from the reference's own precision
+floor, and anything an order worse is a real defect, not dtype noise.
+
+Bundle: 23 MB, 18 tensors, hashed manifest with per-tensor stats,
+torch/numpy versions, seed, and the RoPE metadata. Next session: the
+ZML side — f64 table generation matching the numpy semantics, the
+block graph, and `//ltx:block_conformance` walking the stages in
+order.
