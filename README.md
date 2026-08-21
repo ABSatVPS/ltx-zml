@@ -18,17 +18,24 @@ model revisions, compiler versions, hardware, or the quantized
 48-block execution that Phase 3 must earn separately. Measured on
 the target card: XLA routes large f16 GEMMs to hipBLASLt and reaches
 ~59 TFLOP/s on gfx1200 (matrix cores engaged; autotuning is worth 3×);
-int4-resident weights with in-graph dequant feed those GEMMs at full
-dense speed, so quantized residency costs nothing at prefill sizes; and
-**blockwise online-softmax attention traced through `stablehlo.while`
-runs the full 28k-token LTX working length on 16 GB** — bit-identical to
-its unrolled twin, beating naive sdpa where naive fits at all (naive
-materializes f32 scores and dies at a quarter of video length). Also
-learned the hard way: naive device-to-host readback runs at ~0.5 GB/s,
-so everything stays on device until the final frames. Attention geometry
-is verified against LTX-2.5's own code (32 heads × 128, 48 layers). Next:
-E4 (VAE conv tiles), then a real transformer block against the HF
-oracle. The journal at [docs/lab-notebook.md](docs/lab-notebook.md) is
+in-graph dequant feeds those GEMMs at full dense speed (the settled
+quantization recipe is int8 grouped-128 — plain int4 at any granularity
+fails on this model's outlier-heavy weights, which is why upstream
+ships int8 too); and **blockwise online-softmax attention traced
+through `stablehlo.while` runs the full 28k-token LTX working length on
+16 GB** — bit-identical to its unrolled twin, beating naive sdpa where
+naive fits at all, and now carrying conformance receipts inside the
+block itself (agreement with dense attention at 1.1e-6, block and
+three-block-chain oracle gates unchanged by the swap). A 0/23/47
+three-block chain conforms with sub-linear error growth, and the fully
+int8-quantized block sits at the reference's own bf16 deployment
+floor. Also learned the hard way: naive device-to-host readback runs
+at ~0.5 GB/s, so everything stays on device until the final frames.
+Attention geometry is verified against LTX-2.5's own code (32 heads ×
+128, 48 layers). Next: the distilled scheduler compared
+update-by-update, then the streaming loader (~20 GB DiT through a
+15 GB-RAM machine), then 48-block assembly. The journal at
+[docs/lab-notebook.md](docs/lab-notebook.md) is
 the source of truth — it logs the why behind each decision, with
 hypotheses written down before the measurements, including the ones
 that died. [ROADMAP.md](ROADMAP.md) tracks the phases ahead and what

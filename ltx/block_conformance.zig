@@ -196,6 +196,67 @@ fn rope(x4: zml.Tensor, cos: zml.Tensor, sin: zml.Tensor) zml.Tensor {
     return zml.Tensor.concatenate(&.{ ra, rb }, .f);
 }
 
+/// Which SDPA the block traces: XLA's dense softmax path, or the E3w
+/// stablehlo.while online-softmax kernel — the production attention at
+/// T≈28k, where dense scores would need ~100 GB (run 7/8b).
+const Algo = enum { dense, blockwise };
+
+/// E3w chunk for the f32 twin. Module const because the while body is a
+/// nested fn and cannot close over runtime values. 16 gives 4 iterations
+/// over T=64, so the rescale-correction path runs 3 times; a single chunk
+/// of T would degenerate into plain softmax and test only loop plumbing.
+const ACHUNK: i64 = 16;
+
+/// The E3w kernel's f32 twin: the same loop-carried (step, m, l, acc)
+/// while as smoke.zig's blockwiseWhileSdpaGraph, but f32 matmuls (the
+/// harness dtype) and the 1/sqrt(hd) scale applied to K exactly where
+/// zml.nn.sdpa applies it — so the agreement gate sees ONLY the
+/// online-softmax algorithm. q3 [.q,.h,.hd], k3/v3 [.k,.h,.hd]; returns
+/// [.h,.q,.hd] (dot leads with batch dims).
+fn whileSdpa(q3: zml.Tensor, k3: zml.Tensor, v3: zml.Tensor) zml.Tensor {
+    const n_chunks: i64 = @divExact(T, ACHUNK);
+    const hd_f: f32 = @floatFromInt(HD);
+    const k = k3.mul(zml.Tensor.scalar(1.0 / @sqrt(hd_f), .f32));
+
+    const hq_shape = zml.Shape.init(.{ .h = H, .q = T }, .f32);
+    const acc_shape = zml.Shape.init(.{ .h = H, .q = T, .hd = HD }, .f32);
+    // Finite lowest (not -inf): exp(m0 - m_new) underflows cleanly to 0 on
+    // the first iteration instead of -inf minus -inf = NaN.
+    const m0 = zml.Tensor.scalar(-std.math.floatMax(f32), .f32).broad(hq_shape);
+    const l0 = zml.Tensor.scalar(0, .f32).broad(hq_shape);
+    const acc0 = zml.Tensor.scalar(0, .f32).broad(acc_shape);
+
+    const Ctx = struct { q: zml.Tensor, k: zml.Tensor, v: zml.Tensor, n: zml.Tensor };
+    const Local = struct {
+        fn cond(step: zml.Tensor, _: zml.Tensor, _: zml.Tensor, _: zml.Tensor, c: Ctx) zml.Tensor {
+            return step.cmp(.LT, c.n);
+        }
+        fn body(step: zml.Tensor, m: zml.Tensor, l: zml.Tensor, acc: zml.Tensor, c: Ctx) [4]zml.Tensor {
+            const off = step.mul(zml.Tensor.scalar(ACHUNK, .i32));
+            const kc = c.k.dynamicSlice(.{ .k = zml.Tensor.DynSlice{ .start = off, .len = ACHUNK } });
+            const vc = c.v.dynamicSlice(.{ .k = zml.Tensor.DynSlice{ .start = off, .len = ACHUNK } });
+            const s = c.q.dot(kc, .hd); // [.h,.q,.k]
+            const cmax = s.max(.k).squeeze(.k); // [.h,.q]
+            const m_new = m.maximum(cmax);
+            const corr = m.sub(m_new).exp();
+            const p = s.sub(m_new.broad(s.shape())).exp();
+            const l_new = l.mul(corr).add(p.sum(.k).squeeze(.k));
+            const pv = p.dot(vc, .k); // [.h,.q,.hd]
+            const acc_new = acc.mul(corr.broad(acc.shape())).add(pv);
+            return .{ step.addConstant(1), m_new, l_new, acc_new };
+        }
+    };
+
+    const ctx: Ctx = .{ .q = q3, .k = k, .v = v3, .n = zml.Tensor.scalar(n_chunks, .i32) };
+    const res = zml.ops.@"while"(
+        .{ zml.Tensor.scalar(0, .i32), m0, l0, acc0 },
+        Local.cond,
+        Local.body,
+        .{ctx},
+    );
+    return res[3].div(res[2].broad(acc_shape));
+}
+
 const Block = struct {
     q1_w: zml.Tensor,
     q1_b: zml.Tensor,
@@ -252,7 +313,7 @@ const Block = struct {
     /// Attention per the reference: qk-norm (weighted, full 4096) then
     /// optional RoPE, sdpa, optional 2*sigmoid per-head gate from the
     /// attention INPUT, then output projection.
-    fn attention(w: A, x: zml.Tensor, ctx: zml.Tensor, n_kv: i64, pe: ?struct { cos: zml.Tensor, sin: zml.Tensor }, comptime gated: bool) zml.Tensor {
+    fn attention(w: A, x: zml.Tensor, ctx: zml.Tensor, n_kv: i64, pe: ?struct { cos: zml.Tensor, sin: zml.Tensor }, comptime gated: bool, comptime algo: Algo) zml.Tensor {
         var q = rmsW(lin(x, w.qw, w.qb), w.qn);
         var k = rmsW(lin(ctx, w.kw, w.kb), w.kn);
         const v = lin(ctx, w.vw, w.vb);
@@ -272,7 +333,10 @@ const Block = struct {
         }
         const v3 = v.reshape(zml.Shape.init(.{ .k = n_kv, .h = H, .hd = HD }, .f32));
 
-        var out = zml.nn.sdpa(q3, k3, v3, .{}); // [.h,.q,.hd]-tagged
+        var out = switch (algo) {
+            .dense => zml.nn.sdpa(q3, k3, v3, .{}), // [.h,.q,.hd]-tagged
+            .blockwise => whileSdpa(q3, k3, v3),
+        };
         if (gated) {
             const glog = lin(x, w.gw, w.gb).withTags(.{ .q, .h }); // [T, 32]
             const gate = glog.sigmoid().scale(2.0);
@@ -297,25 +361,34 @@ const Block = struct {
 
     pub fn s2Attn1NoGate(self: @This(), x: zml.Tensor, ts3: zml.Tensor, cos: zml.Tensor, sin: zml.Tensor) zml.Tensor {
         const n = self.s1NormMsa(x, ts3);
-        return attention(self.attn1w(), n, n, T, .{ .cos = cos, .sin = sin }, false);
+        return attention(self.attn1w(), n, n, T, .{ .cos = cos, .sin = sin }, false, .dense);
+    }
+
+    fn attn1Out(self: @This(), x: zml.Tensor, ts3: zml.Tensor, cos: zml.Tensor, sin: zml.Tensor, comptime algo: Algo) zml.Tensor {
+        const n = self.s1NormMsa(x, ts3);
+        return attention(self.attn1w(), n, n, T, .{ .cos = cos, .sin = sin }, true, algo);
     }
 
     pub fn s3Attn1(self: @This(), x: zml.Tensor, ts3: zml.Tensor, cos: zml.Tensor, sin: zml.Tensor) zml.Tensor {
-        const n = self.s1NormMsa(x, ts3);
-        return attention(self.attn1w(), n, n, T, .{ .cos = cos, .sin = sin }, true);
+        return self.attn1Out(x, ts3, cos, sin, .dense);
     }
 
-    fn afterSa(self: @This(), x: zml.Tensor, ts3: zml.Tensor, cos: zml.Tensor, sin: zml.Tensor) zml.Tensor {
+    /// E3w agreement probe: gated attn1 through the while kernel.
+    pub fn wAttn1(self: @This(), x: zml.Tensor, ts3: zml.Tensor, cos: zml.Tensor, sin: zml.Tensor) zml.Tensor {
+        return self.attn1Out(x, ts3, cos, sin, .blockwise);
+    }
+
+    fn afterSa(self: @This(), x: zml.Tensor, ts3: zml.Tensor, cos: zml.Tensor, sin: zml.Tensor, comptime algo: Algo) zml.Tensor {
         const gate = adaVal(self.sst, ts3, 2);
-        return x.add(self.s3Attn1(x, ts3, cos, sin).mul(gate));
+        return x.add(self.attn1Out(x, ts3, cos, sin, algo).mul(gate));
     }
 
     pub fn s4AfterSa(self: @This(), x: zml.Tensor, ts3: zml.Tensor, cos: zml.Tensor, sin: zml.Tensor) zml.Tensor {
-        return self.afterSa(x, ts3, cos, sin);
+        return self.afterSa(x, ts3, cos, sin, .dense);
     }
 
     pub fn s4Normed(self: @This(), x: zml.Tensor, ts3: zml.Tensor, cos: zml.Tensor, sin: zml.Tensor) zml.Tensor {
-        return rmsNoW(self.afterSa(x, ts3, cos, sin));
+        return rmsNoW(self.afterSa(x, ts3, cos, sin, .dense));
     }
 
     fn caOut(self: @This(), x_normed: zml.Tensor, ts3: zml.Tensor, ctx: zml.Tensor, pts2: zml.Tensor) zml.Tensor {
@@ -329,34 +402,57 @@ const Block = struct {
         const shift_kv = kv.slice1d(.n, .{ .start = 0, .end = 1 }).squeeze(.n);
         const scale_kv = kv.slice1d(.n, .{ .start = 1, .end = 2 }).squeeze(.n);
         const enc = ctx.mul(scale_kv.broad(ctx.shape()).addConstant(1.0)).add(shift_kv.broad(ctx.shape()));
-        const ca = attention(self.attn2w(), attn_in, enc, S, null, true);
+        // Cross-attention stays dense at every algo (pre-registered scope:
+        // S=32 here, ~1k at deployment — the E3w memory argument is absent).
+        const ca = attention(self.attn2w(), attn_in, enc, S, null, true, .dense);
         return ca.mul(gate_ca);
     }
 
-    pub fn s5CaOut(self: @This(), x: zml.Tensor, ts3: zml.Tensor, ctx: zml.Tensor, pts2: zml.Tensor, cos: zml.Tensor, sin: zml.Tensor) zml.Tensor {
-        return self.caOut(self.s4Normed(x, ts3, cos, sin), ts3, ctx, pts2);
+    fn s5CaOutA(self: @This(), x: zml.Tensor, ts3: zml.Tensor, ctx: zml.Tensor, pts2: zml.Tensor, cos: zml.Tensor, sin: zml.Tensor, comptime algo: Algo) zml.Tensor {
+        return self.caOut(rmsNoW(self.afterSa(x, ts3, cos, sin, algo)), ts3, ctx, pts2);
     }
 
-    fn afterCa(self: @This(), x: zml.Tensor, ts3: zml.Tensor, ctx: zml.Tensor, pts2: zml.Tensor, cos: zml.Tensor, sin: zml.Tensor) zml.Tensor {
-        return self.afterSa(x, ts3, cos, sin).add(self.s5CaOut(x, ts3, ctx, pts2, cos, sin));
+    pub fn s5CaOut(self: @This(), x: zml.Tensor, ts3: zml.Tensor, ctx: zml.Tensor, pts2: zml.Tensor, cos: zml.Tensor, sin: zml.Tensor) zml.Tensor {
+        return self.s5CaOutA(x, ts3, ctx, pts2, cos, sin, .dense);
+    }
+
+    fn afterCa(self: @This(), x: zml.Tensor, ts3: zml.Tensor, ctx: zml.Tensor, pts2: zml.Tensor, cos: zml.Tensor, sin: zml.Tensor, comptime algo: Algo) zml.Tensor {
+        return self.afterSa(x, ts3, cos, sin, algo).add(self.s5CaOutA(x, ts3, ctx, pts2, cos, sin, algo));
+    }
+
+    fn s6FfInA(self: @This(), x: zml.Tensor, ts3: zml.Tensor, ctx: zml.Tensor, pts2: zml.Tensor, cos: zml.Tensor, sin: zml.Tensor, comptime algo: Algo) zml.Tensor {
+        const shift = adaVal(self.sst, ts3, 3);
+        const scl = adaVal(self.sst, ts3, 4);
+        return modulate(rmsNoW(self.afterCa(x, ts3, ctx, pts2, cos, sin, algo)), scl, shift);
     }
 
     pub fn s6FfIn(self: @This(), x: zml.Tensor, ts3: zml.Tensor, ctx: zml.Tensor, pts2: zml.Tensor, cos: zml.Tensor, sin: zml.Tensor) zml.Tensor {
-        const shift = adaVal(self.sst, ts3, 3);
-        const scl = adaVal(self.sst, ts3, 4);
-        return modulate(rmsNoW(self.afterCa(x, ts3, ctx, pts2, cos, sin)), scl, shift);
+        return self.s6FfInA(x, ts3, ctx, pts2, cos, sin, .dense);
     }
 
-    pub fn s7FfOut(self: @This(), x: zml.Tensor, ts3: zml.Tensor, ctx: zml.Tensor, pts2: zml.Tensor, cos: zml.Tensor, sin: zml.Tensor) zml.Tensor {
-        const ff_in = self.s6FfIn(x, ts3, ctx, pts2, cos, sin);
+    fn s7FfOutA(self: @This(), x: zml.Tensor, ts3: zml.Tensor, ctx: zml.Tensor, pts2: zml.Tensor, cos: zml.Tensor, sin: zml.Tensor, comptime algo: Algo) zml.Tensor {
+        const ff_in = self.s6FfInA(x, ts3, ctx, pts2, cos, sin, algo);
         const h = lin(ff_in, self.ff1_w, null).gelu();
         return lin(h, self.ff2_w, null);
     }
 
-    pub fn blockOut(self: @This(), x: zml.Tensor, ts3: zml.Tensor, ctx: zml.Tensor, pts2: zml.Tensor, cos: zml.Tensor, sin: zml.Tensor) zml.Tensor {
+    pub fn s7FfOut(self: @This(), x: zml.Tensor, ts3: zml.Tensor, ctx: zml.Tensor, pts2: zml.Tensor, cos: zml.Tensor, sin: zml.Tensor) zml.Tensor {
+        return self.s7FfOutA(x, ts3, ctx, pts2, cos, sin, .dense);
+    }
+
+    fn blockOutA(self: @This(), x: zml.Tensor, ts3: zml.Tensor, ctx: zml.Tensor, pts2: zml.Tensor, cos: zml.Tensor, sin: zml.Tensor, comptime algo: Algo) zml.Tensor {
         const gate = adaVal(self.sst, ts3, 5);
-        return self.afterCa(x, ts3, ctx, pts2, cos, sin)
-            .add(self.s7FfOut(x, ts3, ctx, pts2, cos, sin).mul(gate));
+        return self.afterCa(x, ts3, ctx, pts2, cos, sin, algo)
+            .add(self.s7FfOutA(x, ts3, ctx, pts2, cos, sin, algo).mul(gate));
+    }
+
+    pub fn blockOut(self: @This(), x: zml.Tensor, ts3: zml.Tensor, ctx: zml.Tensor, pts2: zml.Tensor, cos: zml.Tensor, sin: zml.Tensor) zml.Tensor {
+        return self.blockOutA(x, ts3, ctx, pts2, cos, sin, .dense);
+    }
+
+    /// E3w swap: the whole block with while attention in attn1.
+    pub fn wBlockOut(self: @This(), x: zml.Tensor, ts3: zml.Tensor, ctx: zml.Tensor, pts2: zml.Tensor, cos: zml.Tensor, sin: zml.Tensor) zml.Tensor {
+        return self.blockOutA(x, ts3, ctx, pts2, cos, sin, .blockwise);
     }
 
     /// f32 attn1 pre-softmax logits — probe 1's baseline for the int4 rung.
@@ -463,6 +559,13 @@ const Chain = struct {
 
     pub fn chainB47(self: @This(), x: zml.Tensor, ts3: zml.Tensor, ctx: zml.Tensor, pts2: zml.Tensor, cos: zml.Tensor, sin: zml.Tensor) zml.Tensor {
         return self.b47.blockOut(self.chainB23(x, ts3, ctx, pts2, cos, sin), ts3, ctx, pts2, cos, sin);
+    }
+
+    /// E3w compounding probe: while attention in all three blocks.
+    pub fn wChainB47(self: @This(), x: zml.Tensor, ts3: zml.Tensor, ctx: zml.Tensor, pts2: zml.Tensor, cos: zml.Tensor, sin: zml.Tensor) zml.Tensor {
+        const y0 = self.b0.wBlockOut(x, ts3, ctx, pts2, cos, sin);
+        const y23 = self.b23.wBlockOut(y0, ts3, ctx, pts2, cos, sin);
+        return self.b47.wBlockOut(y23, ts3, ctx, pts2, cos, sin);
     }
 };
 
@@ -817,6 +920,69 @@ pub fn main(init: std.process.Init) !void {
         if (!compare(st.method, got, want, 2e-3)) all_pass = false;
     }
 
+    // ---- E3w swap gates (pre-registered 2026-08-21) -----------------------
+    // The production attention (stablehlo.while online softmax, run 8b) has
+    // never run inside the block. Overlap domain at T=64: dense is
+    // torch-anchored, the f32 while twin differs ONLY in algorithm.
+    // H-E3W-1 budget 1e-5 (expected ~1e-7 f32 reordering noise); H-E3W-2/3
+    // keep the standard 2e-3 oracle gates.
+    {
+        const dense_attn = try allocator.alloc(f32, out_len);
+        defer allocator.free(dense_attn);
+        inline for (.{ "s3Attn1", "wAttn1" }, .{ dense_attn, got }) |mname, dst| {
+            const method = comptime std.meta.stringToEnum(std.meta.DeclEnum(Block), mname).?;
+            var exe = try platform.compile(allocator, io, model, method, .{ x_spec, ts_spec, cos_spec, sin_spec }, .{});
+            var args = try exe.args(allocator);
+            defer args.deinit(allocator);
+            var results = try exe.results(allocator);
+            defer results.deinit(allocator);
+            args.set(.{ bufs, x_buf, ts_buf, cos_buf, sin_buf });
+            exe.call(args, &results);
+            var out: zml.Buffer = results.get(zml.Buffer);
+            defer out.deinit();
+            var slice = try out.toSliceAlloc(allocator, io);
+            defer slice.free(allocator);
+            @memcpy(dst, slice.constItems(f32)[0..out_len]);
+        }
+        if (!compare("e3w-attn1-agreement", got, dense_attn, 1e-5)) all_pass = false;
+    }
+    {
+        const wmethod = comptime std.meta.stringToEnum(std.meta.DeclEnum(Block), "wBlockOut").?;
+        var exe = try platform.compile(allocator, io, model, wmethod, .{ x_spec, ts_spec, ctx_spec, pts_spec, cos_spec, sin_spec }, .{});
+        var args = try exe.args(allocator);
+        defer args.deinit(allocator);
+        var results = try exe.results(allocator);
+        defer results.deinit(allocator);
+        args.set(.{ bufs, x_buf, ts_buf, ctx_buf, pts_buf, cos_buf, sin_buf });
+        exe.call(args, &results);
+        var out: zml.Buffer = results.get(zml.Buffer);
+        defer out.deinit();
+        var slice = try out.toSliceAlloc(allocator, io);
+        defer slice.free(allocator);
+        @memcpy(got, slice.constItems(f32)[0..out_len]);
+        const want = try loadF32(allocator, io, BUNDLE, "block_out.bin", out_len);
+        defer allocator.free(want);
+        if (!compare("e3w-blockOut-vs-oracle", got, want, 2e-3)) all_pass = false;
+    }
+    {
+        const wmethod = comptime std.meta.stringToEnum(std.meta.DeclEnum(Chain), "wChainB47").?;
+        var exe = try platform.compile(allocator, io, chain_model, wmethod, .{ x_spec, ts_spec, ctx_spec, pts_spec, cos_spec, sin_spec }, .{});
+        var args = try exe.args(allocator);
+        defer args.deinit(allocator);
+        var results = try exe.results(allocator);
+        defer results.deinit(allocator);
+        args.set(.{ cbufs, x_buf, ts_buf, ctx_buf, pts_buf, cos_buf, sin_buf });
+        exe.call(args, &results);
+        var out: zml.Buffer = results.get(zml.Buffer);
+        defer out.deinit();
+        var slice = try out.toSliceAlloc(allocator, io);
+        defer slice.free(allocator);
+        @memcpy(got, slice.constItems(f32)[0..out_len]);
+        const want = try loadF32(allocator, io, CHAIN_BUNDLE, "chain_b47_out.bin", out_len);
+        defer allocator.free(want);
+        if (!compare("e3w-chainB47-vs-oracle", got, want, 2e-3)) all_pass = false;
+    }
+
     // ---- int4 rung 1: qkv class, budgets pre-registered -------------------
     // Baselines are OUR f32 graphs (torch-anchored above); budgets from the
     // notebook: logits 5e-2, attention output 2e-2, block 2e-2.
@@ -917,7 +1083,7 @@ pub fn main(init: std.process.Init) !void {
     }
 
     if (all_pass) {
-        log.info("BLOCK CONFORMANCE: ALL GATES PASS (single block + chain + fully quantized block)", .{});
+        log.info("BLOCK CONFORMANCE: ALL GATES PASS (single block + chain + E3w swap + fully quantized block)", .{});
     } else {
         log.err("BLOCK CONFORMANCE: FAILURES ABOVE", .{});
         return error.ConformanceFailed;

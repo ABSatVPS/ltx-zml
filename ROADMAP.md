@@ -59,14 +59,25 @@ revision-pinned range-request weight fetcher, torch-CPU oracle bundle
 generator with staged dumps verified identical to the reference
 forward, and `//ltx:block_conformance`.
 
-## Phase 3 — Full video-stream DiT — NEXT
+## Phase 3 — Full video-stream DiT — IN PROGRESS
 
-All 48 blocks, int4-resident (~11 GB) via the sub-byte PJRT path,
-static-shape executables replayed across the distilled model's few
-steps. Text conditioning arrives as precomputed embeddings (Phase 4
-runs offline first). Audio stream stubbed out — the checkpoint's
-bridges are skipped, accepting divergence from joint generation until
-Phase 7.
+All 48 blocks at int8-g128 (~20 GB, streamed through the block-prefetch
+pipeline — the int4-residency plan died on the model's outlier-heavy
+weight statistics; ladder receipts in the notebook), static-shape
+executables replayed across the distilled model's few steps. Text
+conditioning arrives as precomputed embeddings (Phase 4 runs offline
+first). Audio stream stubbed out — the checkpoint's bridges are
+skipped, accepting divergence from joint generation until Phase 7.
+
+Landed so far: the 0/23/47 chain conforms with sub-linear error growth
+(2.68e-6 at three blocks); the quantization recipe is settled
+(int8-g128 large projections, fully quantized block at the bf16
+floor); the streaming loader is designed (notebook, ring-lifecycle
+contract); and the E3w while-loop attention — the only attention that
+fits at T≈28k — is swapped into the block path and gated: agreement
+with dense 1.09e-6, oracle conformance unchanged (1.80e-6 block,
+2.68e-6 chain). Remaining: the scheduler compared update-by-update,
+the streaming loader build, then 48-block assembly.
 
 Done means: latents for a fixed seed and fixed precomputed conditioning
 match the reference pipeline's within tolerance, step by step, and a

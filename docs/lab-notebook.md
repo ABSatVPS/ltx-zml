@@ -1230,3 +1230,143 @@ ring slots with explicit states (filling → ready → in-use → free),
 transitions asserted, zero steady-state allocation, and — the schedule
 being deterministic — the whole state machine verified as a static
 cycle at startup, before the first frame.
+
+## 2026-08-21 — E3w moves into the block: hypotheses before the swap
+
+Erratum first: the calendar drifted during the overnight sessions. The
+five entries above dated 2026-08-22 (int4 rung through the streaming
+design) were actually written late 2026-08-20 into 2026-08-21 — a day
+ahead of reality. The headers stay as written (they are committed and
+pushed; the ORDER is correct and that is what matters for provenance),
+but from here the dates are back on the real clock. Lesson for the
+journal: dates are data too, and data gets checked.
+
+Now the first of Phase 3's three remaining pre-assembly items, in the
+pre-registered order: the E3w attention kernel swapped into the block
+path, behind an overlap-domain agreement gate.
+
+Why the swap is not optional. At deployment length the dense score
+matrix is [32 heads, T, T] f32 with T ≈ 26–28k: roughly 100 GB for one
+block's self-attention. Run 7 showed the trace-time-unrolled blockwise
+form OOMs at T=16384 because XLA's buffer assignment keeps chunk
+intermediates alive across unrolled iterations; run 8b showed the
+`stablehlo.while` form with loop-carried (step, m, l, acc) runs
+T=28672 in bounded memory at 11 TFLOP/s, bit-identical to the unrolled
+form where both run. So the while kernel IS the production attention.
+But every conformance number we have — 19 gates, the chain, the
+quantized block — was earned with `zml.nn.sdpa`, XLA's dense softmax
+path. The kernel that ships has never run inside the block, surrounded
+by qk-norm, RoPE, the 2σ gate, and the output projection. That is the
+gap this entry closes.
+
+The overlap-domain design, following the E3 template (dense and
+blockwise cross-checked at T ≤ 8192 where both fit): at the harness
+geometry T=64 both algorithms run comfortably, so dense — already
+anchored to the torch oracle at 1.85e-6 — becomes the baseline, and
+the while kernel is measured against it with everything else held
+fixed. Two choices make the isolation honest:
+
+First, the harness twin of the E3w kernel is written in f32, NOT the
+f16-matmul deployment form. The conformance harness is f32 throughout
+precisely so that spec errors are not confused with dtype noise; an
+f16 kernel here would smear ~1e-3 of cast noise over a comparison
+whose whole point is to see the algorithm alone. The f16 form is the
+perf pass's business, and the bf16 floor (5.9e-3) is already
+calibrated for when it arrives.
+
+Second, a detail read out of `zml.nn.sdpa`'s source before
+registering: it applies the 1/sqrt(hd) scale to K (not Q) and runs
+softmax in f32. The twin copies the K-side scaling so that
+scale-placement rounding cannot pollute the comparison. The smoke-test
+E3w kernel scales Q — an ulp-level placement difference, noted here so
+the perf pass reconciles it deliberately instead of discovering it.
+
+Chunk size: 16, giving 4 loop iterations over T=64, of which 3
+traverse the rescale-correction path (m_new, corr = exp(m − m_new),
+the l and acc rescales). A single chunk of 64 would degenerate the
+online softmax into plain max-subtracted softmax and test nothing but
+the loop plumbing.
+
+Pre-registered hypotheses and budgets, before any measurement:
+
+H-E3W-1 (agreement): while-attn1 vs dense-attn1 stage output, same
+weights, same inputs, both f32 — budget rel-RMS 1e-5, expected order
+1e-7. The two compute the same mathematics; the only legitimate
+difference is f32 reordering noise (4-chunk PV accumulation plus at
+most 3 rescale multiplies ≈ a few ulp). A failure near 1e-1 means the
+algorithm is wrong (chunk offsets, missing rescale); a failure near
+1e-3 means something subtler and gets investigated, not negotiated.
+
+H-E3W-2 (oracle held): the full block with while-attn1 vs the torch
+oracle block_out, the standard 2e-3 gate — predicted within 2× of the
+dense block's 1.85e-6. The swap should be invisible at block scale.
+
+H-E3W-3 (compounding): the 0/23/47 chain with while attention in all
+three blocks vs the chain oracle — predicted within 2× of the dense
+chain's 2.74e-6, sub-linear growth preserved. Three swapped blocks in
+series is the cheapest available evidence that the kernel's noise does
+not compound pathologically.
+
+Scope, pre-registered: cross-attention stays dense. S=32 in the
+harness and at most ~1k tokens of prompt context at deployment — the
+memory argument that forces E3w simply does not apply, and dense at
+small S is the better-tested path. This is a decision, not an
+omission.
+
+## 2026-08-21, continued — the swap conforms; one expectation misses by 10× and teaches something
+
+Implementation notes first, then numbers. The while kernel's f32 twin
+went in as a module function; the block's `attention` gained a
+comptime algorithm switch threaded through the recompute-prefix chain
+(every public stage method keeps its name and dense default, so all 19
+existing gates are byte-for-byte the same graphs). Two new public
+probes — wAttn1, wBlockOut — plus wChainB47 on the chain. One tag
+lesson worth keeping: ZML's `dot` leads its result with the batch
+dims, so q [.q,.h,.hd] against k [.k,.h,.hd] produces [.h,.q,.k], and
+the while loop's carried stats are [.h,.q] — read out of
+`dotGeneral`'s source before writing the kernel, not discovered by a
+shape panic after.
+
+All 22 gates pass. The three new ones, against their registrations:
+
+H-E3W-1, agreement: rel-RMS **1.094e-6** against a 1e-5 budget —
+PASS with 9× headroom, but 10× above my expected ~1e-7. The miss has
+an identifiable cause and it is not the algorithm: 1.09e-6 is exactly
+the scale of ONE f32 4096-length GEMM's reordering noise (compare
+s1bQnorm's 1.15e-6, which is a projection plus a norm and nothing
+else). Dense and while attn1 are two separately compiled executables,
+and XLA autotunes each GEMM per executable — the q/k/v/out projections
+surrounding the attention can land on different hipBLASLt tilings in
+the two graphs (the E1b forensics already showed the autotuner picks
+different algorithms in different contexts). The twin-graph design
+isolates the algorithm at the GRAPH level but cannot pin the
+compiler's per-executable GEMM choices. The expected-order error was
+naivety about cross-executable determinism, not about online softmax.
+Registered for the future: any "these two graphs should agree to
+ulps" claim must either share one executable or budget one GEMM's
+reordering noise (~1e-6) per differing projection.
+
+H-E3W-2, oracle held: wBlockOut vs torch **1.797e-6**, dense blockOut
+in the same run 1.843e-6 — the swapped block is not just within the
+predicted 2×, it is statistically IDENTICAL to dense against the
+oracle. The swap is invisible at block scale, as registered.
+
+H-E3W-3, compounding: wChainB47 vs the chain oracle **2.684e-6**,
+dense chain 2.735e-6 in the same run. Sub-linear growth preserved
+(1.80e-6 at one block → 2.68e-6 at three); no pathological
+compounding. Confirmed.
+
+Regression control, for free: every previously recorded gate
+reproduced its number exactly — blockOut 1.843e-6, chain 2.735e-6,
+fully quantized block 5.237e-3, RoPE 0/262,144. The harness is
+deterministic run to run, which is what makes the agreement gate's
+1.09e-6 attributable to graph differences rather than run noise.
+
+Status: Phase 3 pre-assembly item one of three is closed. The
+production attention now has conformance receipts INSIDE the block —
+RoPE, qk-norm, 2σ gate, projections and all — not just standalone.
+What this deliberately did not test, still owed later: the f16-matmul
+deployment form of the kernel (perf pass, judged against the 5.9e-3
+bf16 floor), and the Q-side vs K-side scale placement reconciliation
+noted at registration. Next in the pre-registered order: the
+distilled scheduler, compared update-by-update.
