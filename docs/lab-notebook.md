@@ -1187,3 +1187,46 @@ stays open as the future play that could halve that again.
 Phase 3's quantization item is closed. Remaining before the 48-block
 assembly: the E3w attention swap behind its overlap-domain gate, the
 scheduler comparison, and the block-streaming loader.
+
+## 2026-08-22, evening — the streaming loader's design, from an unexpected angle
+
+Adam connected his agent-memory work (a tombstone-based lifecycle
+design) to the streaming problem, and the conversation produced the
+loader's spec — after one measurement and one mechanism correction.
+
+The measurement first, house rules: cross-block weight similarity on
+the fetched blocks 0/23/47 reads cosine +0.0001 to +0.0016 with
+inter-block deltas carrying MORE energy than the tensors themselves
+(rel-RMS 1.16–1.19, near independent-noise √2). Structural redundancy
+across layers is dead as a working-set reducer; entropy coding would
+recover maybe 5–15% and is not worth a hot-path decompression stage.
+
+The correction: mmap is zero-copy only host-side. DMA from pageable
+memory routes through a hidden pinned bounce buffer — the same
+~0.5 GB/s pathology measured three times on readback, reversed. The
+pipeline therefore stages explicitly, every arrow overlapped because
+the block order is compile-time constant:
+
+NVMe → page cache (mmap + kernel readahead) → pinned host ring
+(memcpy) → VRAM ring (async DMA) → compute.
+
+And the relocated insight, which is the load-bearing one: this machine
+has 15 GB of RAM against a ~20 GB quantized model — the model cannot
+be HOST-resident either. The "overflow via virtual memory" instinct is
+exactly right at the disk→RAM boundary: the page cache is the overflow
+manager, holding the hot ~10 GB. Rates: ~20 GB streams per denoising
+step; NVMe ~5 GB/s with cache assist ≈ ~2 s/step of disk traffic —
+free against today's ~60 s/step attention, and the term the
+prefetch-ahead-of-wavefront design exists to hide once attention gets
+its planned 2×+.
+
+Allocation governance: PJRT owns the VRAM allocator, but 48 blocks of
+IDENTICAL geometry mean every allocation is the same size, and
+same-size cycling through a binned allocator cannot fragment — the
+tombstone benefit arrives via architectural regularity. What transfers
+from the agent-memory work wholesale is the lifecycle-invariant
+discipline, adopted as the loader's pre-registered design contract:
+ring slots with explicit states (filling → ready → in-use → free),
+transitions asserted, zero steady-state allocation, and — the schedule
+being deterministic — the whole state machine verified as a static
+cycle at startup, before the first frame.
