@@ -358,6 +358,18 @@ const Block = struct {
         return self.afterCa(x, ts3, ctx, pts2, cos, sin)
             .add(self.s7FfOut(x, ts3, ctx, pts2, cos, sin).mul(gate));
     }
+
+    /// f32 attn1 pre-softmax logits — probe 1's baseline for the int4 rung.
+    pub fn fLogits(self: @This(), x: zml.Tensor, ts3: zml.Tensor, cos: zml.Tensor, sin: zml.Tensor) zml.Tensor {
+        const n = self.s1NormMsa(x, ts3);
+        const q = rmsW(lin(n, self.q1_w, self.q1_b), self.qn1);
+        const k = rmsW(lin(n, self.k1_w, self.k1_b), self.kn1);
+        const q4 = q.reshape(zml.Shape.init(.{ .q = T, .h = H, .p = 2, .f = 64 }, .f32));
+        const k4 = k.reshape(zml.Shape.init(.{ .k = T, .h = H, .p = 2, .f = 64 }, .f32));
+        const q3 = rope(q4, cos, sin).withTags(.{ .q, .h, .hd });
+        const k3 = rope(k4, cos.withTags(.{ .k, .h, .f }), sin.withTags(.{ .k, .h, .f })).withTags(.{ .k, .h, .hd });
+        return q3.dot(k3, .hd);
+    }
 };
 
 // ---- weight loading --------------------------------------------------------
@@ -451,6 +463,114 @@ const Chain = struct {
 
     pub fn chainB47(self: @This(), x: zml.Tensor, ts3: zml.Tensor, ctx: zml.Tensor, pts2: zml.Tensor, cos: zml.Tensor, sin: zml.Tensor) zml.Tensor {
         return self.b47.blockOut(self.chainB23(x, ts3, ctx, pts2, cos, sin), ts3, ctx, pts2, cos, sin);
+    }
+};
+
+// ---- int4 rung (qkv class): dequant-in-graph per E1b ----------------------
+
+/// Grouped-128 dequant (rung 2 of the escalation ladder; the per-row rung 1
+/// measured 0.35/0.25/0.17 against budgets 5e-2/2e-2/2e-2 — the coli-zml
+/// grouped-scale pattern, sc tagged [.o,.g]).
+fn dq4(w: zml.Tensor, sc: zml.Tensor) zml.Tensor {
+    var f = w.convert(.f32);
+    if (w.dtype() == .u4) f = f.addConstant(-8.0); // i8 is signed already
+    const o = f.shape().dim(0);
+    const i_dim = f.shape().dim(1);
+    const ng = sc.shape().dim(1);
+    const f3 = f.reshape(zml.Shape.init(.{ .o = o, .g = ng, .e = @divExact(i_dim, ng) }, .f32));
+    const m = f3.mul(sc.broad(f3.shape()));
+    return m.reshape(zml.Shape.init(.{ .o = o, .i = i_dim }, .f32));
+}
+
+fn linQ(x: zml.Tensor, wq: zml.Tensor, sc: zml.Tensor, b: ?zml.Tensor) zml.Tensor {
+    var y = x.dot(dq4(wq, sc), .i);
+    if (b) |bias| y = y.add(bias.convert(.f32).broad(y.shape()));
+    return y.withTags(.{ .t, .i });
+}
+
+/// Block plus int4 q/k/v for both attentions (rung 1 of the pre-registered
+/// int4 ladder). Everything else rides on `base` in f32/bf16.
+const QBlock = struct {
+    base: Block,
+    q1q: zml.Tensor,
+    q1s: zml.Tensor,
+    k1q: zml.Tensor,
+    k1s: zml.Tensor,
+    v1q: zml.Tensor,
+    v1s: zml.Tensor,
+    q2q: zml.Tensor,
+    q2s: zml.Tensor,
+    k2q: zml.Tensor,
+    k2s: zml.Tensor,
+    v2q: zml.Tensor,
+    v2s: zml.Tensor,
+
+    fn qkRoped(self: @This(), n: zml.Tensor, cos: zml.Tensor, sin: zml.Tensor) struct { q3: zml.Tensor, k3: zml.Tensor } {
+        const q = rmsW(linQ(n, self.q1q, self.q1s, self.base.q1_b), self.base.qn1);
+        const k = rmsW(linQ(n, self.k1q, self.k1s, self.base.k1_b), self.base.kn1);
+        const q4 = q.reshape(zml.Shape.init(.{ .q = T, .h = H, .p = 2, .f = 64 }, .f32));
+        const k4 = k.reshape(zml.Shape.init(.{ .k = T, .h = H, .p = 2, .f = 64 }, .f32));
+        return .{
+            .q3 = rope(q4, cos, sin).withTags(.{ .q, .h, .hd }),
+            .k3 = rope(k4, cos.withTags(.{ .k, .h, .f }), sin.withTags(.{ .k, .h, .f })).withTags(.{ .k, .h, .hd }),
+        };
+    }
+
+    /// Probe 1: attn1 pre-softmax logits, int4 q/k. Compared against the
+    /// f32 twin so softmax amplification is separable from projection error.
+    pub fn qLogits(self: @This(), x: zml.Tensor, ts3: zml.Tensor, cos: zml.Tensor, sin: zml.Tensor) zml.Tensor {
+        const n = self.base.s1NormMsa(x, ts3);
+        const qk = self.qkRoped(n, cos, sin);
+        return qk.q3.dot(qk.k3, .hd);
+    }
+
+    /// Probe 2: full gated attn1 with int4 q/k/v.
+    pub fn qAttn1(self: @This(), x: zml.Tensor, ts3: zml.Tensor, cos: zml.Tensor, sin: zml.Tensor) zml.Tensor {
+        const n = self.base.s1NormMsa(x, ts3);
+        const qk = self.qkRoped(n, cos, sin);
+        const v = linQ(n, self.v1q, self.v1s, self.base.v1_b);
+        const v3 = v.reshape(zml.Shape.init(.{ .k = T, .h = H, .hd = HD }, .f32));
+        var out = zml.nn.sdpa(qk.q3, qk.k3, v3, .{});
+        const glog = lin(n, self.base.g1_w, self.base.g1_b).withTags(.{ .q, .h });
+        out = out.mul(glog.sigmoid().scale(2.0).broad(out.shape()));
+        const merged = out.transpose(.{ .q, .h, .hd }).reshape(zml.Shape.init(.{ .t = T, .i = D }, .f32));
+        return lin(merged, self.base.o1_w, self.base.o1_b);
+    }
+
+    /// Probe 3: the whole block with int4 qkv in BOTH attentions.
+    pub fn qBlockOut(self: @This(), x: zml.Tensor, ts3: zml.Tensor, ctx: zml.Tensor, pts2: zml.Tensor, cos: zml.Tensor, sin: zml.Tensor) zml.Tensor {
+        const b = self.base;
+        const gate_msa = adaVal(b.sst, ts3, 2);
+        const x_sa = x.add(self.qAttn1(x, ts3, cos, sin).mul(gate_msa));
+        const x_normed = rmsNoW(x_sa);
+        // cross-attention with int4 q/k/v
+        const shift_q = adaVal(b.sst, ts3, 6);
+        const scale_q = adaVal(b.sst, ts3, 7);
+        const gate_ca = adaVal(b.sst, ts3, 8);
+        const attn_in = modulate(x_normed, scale_q, shift_q);
+        const kv = b.psst.convert(.f32).add(pts2);
+        const shift_kv = kv.slice1d(.n, .{ .start = 0, .end = 1 }).squeeze(.n);
+        const scale_kv = kv.slice1d(.n, .{ .start = 1, .end = 2 }).squeeze(.n);
+        const enc = ctx.mul(scale_kv.broad(ctx.shape()).addConstant(1.0)).add(shift_kv.broad(ctx.shape()));
+        const q = rmsW(linQ(attn_in, self.q2q, self.q2s, b.q2_b), b.qn2);
+        const k = rmsW(linQ(enc, self.k2q, self.k2s, b.k2_b), b.kn2);
+        const v = linQ(enc, self.v2q, self.v2s, b.v2_b);
+        const q3 = q.reshape(zml.Shape.init(.{ .q = T, .h = H, .hd = HD }, .f32));
+        const k3 = k.reshape(zml.Shape.init(.{ .k = S, .h = H, .hd = HD }, .f32));
+        const v3 = v.reshape(zml.Shape.init(.{ .k = S, .h = H, .hd = HD }, .f32));
+        var ca = zml.nn.sdpa(q3, k3, v3, .{});
+        const glog = lin(attn_in, b.g2_w, b.g2_b).withTags(.{ .q, .h });
+        ca = ca.mul(glog.sigmoid().scale(2.0).broad(ca.shape()));
+        const merged = ca.transpose(.{ .q, .h, .hd }).reshape(zml.Shape.init(.{ .t = T, .i = D }, .f32));
+        const ca_out = lin(merged, b.o2_w, b.o2_b).mul(gate_ca);
+        const x_ca = x_sa.add(ca_out);
+        // ffn (f32 this rung)
+        const shift_mlp = adaVal(b.sst, ts3, 3);
+        const scale_mlp = adaVal(b.sst, ts3, 4);
+        const gate_mlp = adaVal(b.sst, ts3, 5);
+        const ff_in = modulate(rmsNoW(x_ca), scale_mlp, shift_mlp);
+        const ff_out = lin(lin(ff_in, b.ff1_w, null).gelu(), b.ff2_w, null);
+        return x_ca.add(ff_out.mul(gate_mlp));
     }
 };
 
@@ -649,8 +769,103 @@ pub fn main(init: std.process.Init) !void {
         if (!compare(st.method, got, want, 2e-3)) all_pass = false;
     }
 
+    // ---- int4 rung 1: qkv class, budgets pre-registered -------------------
+    // Baselines are OUR f32 graphs (torch-anchored above); budgets from the
+    // notebook: logits 5e-2, attention output 2e-2, block 2e-2.
+    const Q4Spec = struct { qf: []const u8, sf: []const u8, dims: [2]i64 };
+    const q4_specs = [_]struct { field: []const u8, s: Q4Spec }{
+        .{ .field = "q1q", .s = .{ .qf = "attn1_to_q_weight_q8.bin", .sf = "attn1_to_q_weight_q8scale.bin", .dims = .{ D, D } } },
+        .{ .field = "k1q", .s = .{ .qf = "attn1_to_k_weight_q8.bin", .sf = "attn1_to_k_weight_q8scale.bin", .dims = .{ D, D } } },
+        .{ .field = "v1q", .s = .{ .qf = "attn1_to_v_weight_q8.bin", .sf = "attn1_to_v_weight_q8scale.bin", .dims = .{ D, D } } },
+        .{ .field = "q2q", .s = .{ .qf = "attn2_to_q_weight_q8.bin", .sf = "attn2_to_q_weight_q8scale.bin", .dims = .{ D, D } } },
+        .{ .field = "k2q", .s = .{ .qf = "attn2_to_k_weight_q8.bin", .sf = "attn2_to_k_weight_q8scale.bin", .dims = .{ D, D } } },
+        .{ .field = "v2q", .s = .{ .qf = "attn2_to_v_weight_q8.bin", .sf = "attn2_to_v_weight_q8scale.bin", .dims = .{ D, D } } },
+    };
+    var qmodel: QBlock = undefined;
+    var qbufs: zml.Bufferized(QBlock) = undefined;
+    qmodel.base = makeBlockSpecs();
+    qbufs.base = bufs;
+    inline for (q4_specs) |qs| {
+        var namebuf: [256]u8 = undefined;
+        const qname = try std.fmt.bufPrint(&namebuf, "transformer_blocks_0_{s}", .{qs.s.qf});
+        const qraw = try readBin(allocator, io, WEIGHTS, qname);
+        defer allocator.free(qraw);
+        const qshape = zml.Shape.init(.{ .o = qs.s.dims[0], .i = qs.s.dims[1] }, .i8);
+        @field(qbufs, qs.field) = try zml.Buffer.fromBytes(io, platform, qshape, .replicated, qraw);
+        @field(qmodel, qs.field) = zml.Tensor.fromShape(qshape);
+        var namebuf2: [256]u8 = undefined;
+        const sname = try std.fmt.bufPrint(&namebuf2, "transformer_blocks_0_{s}", .{qs.s.sf});
+        const sraw = try readBin(allocator, io, WEIGHTS, sname);
+        defer allocator.free(sraw);
+        const sshape = zml.Shape.init(.{ .o = qs.s.dims[0], .g = @divExact(qs.s.dims[1], 128) }, .f32);
+        const sfield = qs.field[0..2] ++ "s"; // q1q -> q1s etc.
+        @field(qbufs, sfield) = try zml.Buffer.fromBytes(io, platform, sshape, .replicated, sraw);
+        @field(qmodel, sfield) = zml.Tensor.fromShape(sshape);
+    }
+    log.info("int4 qkv: 6 quantized pairs resident", .{});
+
+    const logits_len = @as(usize, @intCast(H * T * T));
+    const lgot = try allocator.alloc(f32, logits_len);
+    defer allocator.free(lgot);
+    const lref = try allocator.alloc(f32, logits_len);
+    defer allocator.free(lref);
+
+    const QProbe = struct { fm: []const u8, qm: []const u8, budget: f64, len: usize, full: bool };
+    const probes = [_]QProbe{
+        .{ .fm = "fLogits", .qm = "qLogits", .budget = 5e-2, .len = logits_len, .full = false },
+        .{ .fm = "s3Attn1", .qm = "qAttn1", .budget = 2e-2, .len = out_len, .full = false },
+        .{ .fm = "blockOut", .qm = "qBlockOut", .budget = 2e-2, .len = out_len, .full = true },
+    };
+    inline for (probes) |p| {
+        const fmethod = comptime std.meta.stringToEnum(std.meta.DeclEnum(Block), p.fm).?;
+        const qmethod = comptime std.meta.stringToEnum(std.meta.DeclEnum(QBlock), p.qm).?;
+        const ref_buf = if (p.len == logits_len) lref else got;
+        const q_buf_out = if (p.len == logits_len) lgot else got;
+        // f32 baseline
+        {
+            var exe = if (p.full)
+                try platform.compile(allocator, io, model, fmethod, .{ x_spec, ts_spec, ctx_spec, pts_spec, cos_spec, sin_spec }, .{})
+            else
+                try platform.compile(allocator, io, model, fmethod, .{ x_spec, ts_spec, cos_spec, sin_spec }, .{});
+            var args = try exe.args(allocator);
+            defer args.deinit(allocator);
+            var results = try exe.results(allocator);
+            defer results.deinit(allocator);
+            if (p.full) args.set(.{ bufs, x_buf, ts_buf, ctx_buf, pts_buf, cos_buf, sin_buf }) else args.set(.{ bufs, x_buf, ts_buf, cos_buf, sin_buf });
+            exe.call(args, &results);
+            var out: zml.Buffer = results.get(zml.Buffer);
+            defer out.deinit();
+            var slice = try out.toSliceAlloc(allocator, io);
+            defer slice.free(allocator);
+            @memcpy(ref_buf[0..p.len], slice.constItems(f32)[0..p.len]);
+        }
+        // int4 variant — note: baseline for probe 2/3 briefly lives in `got`
+        // before the int4 run overwrites it, so copy into place first.
+        const ref_copy = try allocator.alloc(f32, p.len);
+        defer allocator.free(ref_copy);
+        @memcpy(ref_copy, ref_buf[0..p.len]);
+        {
+            var exe = if (p.full)
+                try platform.compile(allocator, io, qmodel, qmethod, .{ x_spec, ts_spec, ctx_spec, pts_spec, cos_spec, sin_spec }, .{})
+            else
+                try platform.compile(allocator, io, qmodel, qmethod, .{ x_spec, ts_spec, cos_spec, sin_spec }, .{});
+            var args = try exe.args(allocator);
+            defer args.deinit(allocator);
+            var results = try exe.results(allocator);
+            defer results.deinit(allocator);
+            if (p.full) args.set(.{ qbufs, x_buf, ts_buf, ctx_buf, pts_buf, cos_buf, sin_buf }) else args.set(.{ qbufs, x_buf, ts_buf, cos_buf, sin_buf });
+            exe.call(args, &results);
+            var out: zml.Buffer = results.get(zml.Buffer);
+            defer out.deinit();
+            var slice = try out.toSliceAlloc(allocator, io);
+            defer slice.free(allocator);
+            @memcpy(q_buf_out[0..p.len], slice.constItems(f32)[0..p.len]);
+        }
+        if (!compare("quant-" ++ p.qm, q_buf_out[0..p.len], ref_copy, p.budget)) all_pass = false;
+    }
+
     if (all_pass) {
-        log.info("BLOCK CONFORMANCE: ALL GATES PASS (single block + 0/23/47 chain)", .{});
+        log.info("BLOCK CONFORMANCE: ALL GATES PASS (single block + 0/23/47 chain + quantized qkv)", .{});
     } else {
         log.err("BLOCK CONFORMANCE: FAILURES ABOVE", .{});
         return error.ConformanceFailed;

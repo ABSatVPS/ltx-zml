@@ -1053,3 +1053,87 @@ regenerated bundle.
 
 Next per the pre-registered ladder: int4, one projection family at a
 time, compared against this f32 chain by projection class.
+
+## 2026-08-22 — int4 rung: budgets pre-registered before the first diff
+
+The character of the oracle changes here. Every gate so far asked "is
+this exact enough to call conformant" and heard ~1e-6. Quantization
+produces errors orders of magnitude larger BY DESIGN, so the
+pre-registration that matters is the acceptance threshold per
+projection class, written before any diff exists — a tolerance chosen
+now is a decision; chosen after, a rationalization. Also recorded from
+review: the f32 chain stays FROZEN as the baseline (never regenerated
+in the same session that compares against it); the ~1e-5 48-block
+extrapolation is an estimate, not a bound, since 0/23/47 cannot rule
+out a pathological interior block (cheap insurance noted: one more
+chain through a random interior triple; not a blocker); and when the
+48-block comptime pressure returns, the structural fix is a runtime
+array over one comptime block type, not a bigger quota.
+
+**Quantization scheme, rung 1:** per-output-row symmetric absmax int4
+(q = clamp(round(w/s), -8, 7), s = absmax/7 per row), weights stored
+unpacked-u4 through the proven sub-byte path, scales in f32 in-graph
+(E1b showed residency is free; no reason to spend precision there),
+dequant traced exactly as E1b validated. Projection classes, in
+introduction order: qkv (the six [4096,4096] q/k/v matrices of both
+attentions), then output projections, then the FFN pair. Gate logits,
+norms, tables, and biases stay f32 permanently — they are noise-sized.
+
+**Budgets, pre-registered:** qkv class — pre-softmax logit rel-RMS
+≤ 5e-2 and post-attention output ≤ 2e-2 against our own f32 graph
+(itself torch-anchored at 1.8e-6, so the comparison is transitively
+grounded); full block with qkv-int4 ≤ 2e-2. Two probes per the review:
+logit error and output error separately, because softmax either washes
+quantization out (high-entropy attention) or amplifies it
+(near-saturated), and the two failures have different fixes.
+
+**Escalation ladder, also pre-registered:** if a class blows budget,
+the lever is granularity, not retreat — grouped-128 scales first, then
+asymmetric quantization on the offending projections (video
+transformers carry outlier channels). Both compose with the
+dequant-in-graph path unchanged.
+
+## 2026-08-22, continued — the quantization ladder, climbed to a pass
+
+Four rungs, every number pre-registered or forecast before measurement,
+ending somewhere better than the budget asked for.
+
+Rung 1, per-row symmetric int4: weight-space rel-RMS 0.19–0.36 across
+the six qkv matrices (scale ranges spanning 50×: heavy outlier rows).
+Probes: logits 0.348, attention output 0.245, block 0.166 — all far
+over the 5e-2/2e-2/2e-2 budgets. The informative part: error
+ATTENUATES through composition (0.35 → 0.25 → 0.17), so softmax washes
+quantization out rather than amplifying it — the failure is pure
+projection precision, exactly the case the granularity lever addresses.
+
+Rung 2, grouped-128 int4: weight error only improved to 0.13–0.20
+(typical LLM weights improve 2–3× here; these improved 1.4×). The
+outliers live INSIDE 128-element groups. Probes 0.237/0.145/0.091 —
+still 3–5× over.
+
+Rung 3, asymmetric grouped-128, measured in weight space only:
+0.142/0.164 — the predicted ~1.2× gain against a needed ~4×. Probe run
+skipped with that justification on the record. **Ladder finding, and a
+real fact about the model: LTX-2.5's attention projections are
+outlier-heavy enough to defeat plain int4 at any granularity or
+asymmetry.** This is presumably WHY Lightricks ships int8-convrot —
+rotation-based outlier suppression — rather than plain low-bit quant.
+Rotation remains open as a future rung (and this repo's coli-zml
+snapshot contains working rotation-fold machinery as prior art); the
+pragmatic rung came first.
+
+Rung 4, int8 grouped-128 for the qkv class: weight error 0.007–0.012
+(the 16× step-size refinement, as arithmetic predicted). Probes:
+logits 1.50e-2 (budget 5e-2), attention output 9.25e-3 (budget 2e-2),
+full block **4.99e-3 (budget 2e-2) — BELOW the reference's own
+measured bf16 deployment floor of 5.9e-3.** The int8-attention block
+is numerically indistinguishable-or-better relative to shipping
+precision. All seventeen gates green in one run: twelve single-block,
+two chain, three quantization.
+
+Emerging mixed-precision plan (to be completed classwise): attention
+projections int8-g128; FFN class next at int4-g128 (FFN weights are
+usually better-behaved — measured, not assumed, next); gates, norms,
+tables, biases f32 forever. Memory arithmetic at that split: roughly
+13 GB for the full dual-stream DiT — on-card, with block streaming as
+backstop.
