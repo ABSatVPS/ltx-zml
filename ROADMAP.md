@@ -89,10 +89,20 @@ calls, ring-streamed weights) matches the torch f64 oracle at six
 stage-walk checkpoints — 1.48e-5 at depth 48 vs a 2e-3 budget, error
 plateauing rather than accumulating — and the fully-quantized walk
 lands at 2.84e-2 end-to-end, DECLINING through the model's second
-half: the int8-g128 recipe survives assembly. Remaining for the
-phase's done-means: the non-block tensors (4.89 GB: patchify, adaln,
-final projections), the bit-exact scheduler driving 48-block passes
-at production T, and the E3w kernel at production length.
+half: the int8-g128 recipe survives assembly.
+
+STEP-BY-STEP CONFORMANCE CLOSED at harness T (2026-08-21 afternoon):
+the E2E-core parts (adaln singles, patchify, the LayerNorm output
+tail) each gated against their own f64 oracles (8/8); the COMPOSED
+forward — patchify → adaln-driven 48 streamed blocks → tail, all on
+device — matches a full-forward f64 oracle at 8.4e-5; and the
+bit-exact scheduler driving the engine through stage 1's full
+8-step distilled trajectory reproduces the reference latents at
+every step (final drift 1.0e-5, 200x under budget, all of it
+velocity-sourced — the scheduler seam is bitwise). Block geometry is
+now trace-time-parametrized (22 gates bitwise-stable). Remaining:
+the production-length clause — fits + runs + time-per-step at
+T≈28k under the E3w kernel (//ltx:e2e_prod, pre-registered).
 
 Done means: latents for a fixed seed and fixed precomputed conditioning
 match the reference pipeline's within tolerance, step by step, and a
