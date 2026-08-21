@@ -30,3 +30,12 @@ zig_binary(
         "//zml",
     ],
 )
+
+# Phase 3: the distilled scheduler vs the reference loop, bit-exact.
+# Host-only — the scheduler is pure f32 arithmetic between DiT calls.
+zig_binary(
+    name = "scheduler_conformance",
+    main = "scheduler_conformance.zig",
+    srcs = ["scheduler.zig"],
+    visibility = ["//visibility:public"],
+)

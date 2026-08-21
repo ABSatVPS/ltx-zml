@@ -1370,3 +1370,172 @@ deployment form of the kernel (perf pass, judged against the 5.9e-3
 bf16 floor), and the Q-side vs K-side scale placement reconciliation
 noted at registration. Next in the pre-registered order: the
 distilled scheduler, compared update-by-update.
+
+## 2026-08-21, later — the distilled scheduler, read line by line: it isn't the scheduler class at all
+
+Phase 3 item two. House rule first: read the reference before
+registering anything. The denoising loop is not in ltx-core — it lives
+in ltx-pipelines, now pinned into the oracle venv beside ltx-core
+1.2.0 (ltx-pipelines 1.0.0, installed --no-deps like everything else
+there). The read produced seven findings, several of which would have
+been wrong guesses:
+
+One. The distilled pipeline does NOT use the LTX2Scheduler class (the
+token-count-shifted sigmoid schedule with terminal stretching). That
+is the dev-model path. Distilled ships HARDCODED sigma lists:
+stage 1 is [1.0, 0.99375, 0.9875, 0.98125, 0.975, 0.909375, 0.725,
+0.421875, 0.0] — eight steps — and stage 2 is [0.909375, 0.725,
+0.421875, 0.0], the three-step tail of stage 1's list. Had we
+implemented "the scheduler," we would have implemented the wrong
+component perfectly.
+
+Two. The pipeline is two-stage: stage 1 at half resolution from pure
+noise, then a 2× spatial upsample of the latent, then stage 2 renoises
+the upsampled latent to sigma 0.909375 and runs the three-step tail.
+
+Three. The step is plain Euler, but the loop routes through x0 space
+with an asymmetry that matters: the model wrapper converts velocity to
+denoised using PER-TOKEN timesteps = denoise_mask · sigma (mask values
+in [0,1]; fractional strengths are legal per the type documentation),
+post_process blends denoised·mask + clean·(1−mask), and then the
+stepper converts BACK to velocity using the SCALAR sigma before
+applying x += v·dt. For mask=1 tokens the round-trip cancels to plain
+Euler on velocity; for mask<1 tokens it does not — that asymmetry IS
+the conditioning mechanism. Scalar-Euler-on-velocity would be an
+invalid simplification of this loop.
+
+Four. The final step (sigma_next = 0) is not special-cased: the update
+is x + ((x−d)/σ)·(−σ), which equals d only up to f32 divide/multiply
+rounding. (The ancestral stepper DOES snap to denoised; the distilled
+loop's Euler stepper does not.) The engine must reproduce the
+rounding, not snap.
+
+Five. to_velocity computes in f32 regardless of storage dtype, takes
+sigma as a Python scalar via .item(), and raises on sigma=0 — which is
+why the loop iterates sigmas[:-1] and never steps FROM zero.
+
+Six. torch.lerp — the noiser's initialization is a chain of two lerps,
+lerp(initial, noise, noise_scale) then lerp(clean, that, mask) — is
+the two-branch numerically-stable kernel: |w| < 0.5 gives a + w·(b−a),
+ELSE b − (b−a)·(1−w). Every weight this pipeline uses (noise_scale 1.0
+and 0.909375; mask 0.5 and 1.0 — note 0.5 is NOT less than 0.5) takes
+the SECOND branch. A naive one-formula lerp on the Zig side would
+diverge in the last ulp. Read out of ATen's Lerp.h before writing,
+not discovered by a failed gate.
+
+Seven. Most sigma values are non-dyadic decimals (0.421875 = 27/64 is
+the only exactly-representable interior value), so the runtime f32
+sigmas are round-to-nearest of the decimal literals. Python and Zig
+both parse decimal→f64 correctly rounded and agree on the f64→f32
+cast, so embedding the literals in Zig is exact — cross-checked by a
+gate anyway.
+
+Bonus find, filed for item three: upstream ships a block_streaming
+package (block_fetcher, pool, provider, stream_sync…) — direct prior
+art for our streaming loader. A comparative read goes into the loader
+entry, not this one.
+
+Oracle boundary, pre-registered: tools/make_scheduler_bundle.py
+IMPORTS and runs the reference's own euler_denoising_loop,
+EulerDiffusionStep, post_process_latent, timesteps_from_mask,
+to_denoised/to_velocity, and GaussianNoiser — no re-implementation on
+the oracle side. The 21B transformer is replaced by pre-generated
+per-step VELOCITY tensors — data, not a function — and the stub
+denoise_fn applies the reference to_denoised with mask-scaled
+timesteps exactly as the X0Model wrapper does. This makes the gate
+blind to everything except the scheduler math, which is the point.
+Storage is f32 on CPU, so serialization is exact by construction (the
+Phase 2 f32_exact lesson, inherited at design time instead of
+rediscovered). A secondary bf16-storage run of the same trajectory
+calibrates the deployment floor.
+
+Geometry: video [1, 64, 128] with mask rows 0–47 at 1.0, rows 48–55
+at 0.0 (pure conditioning), rows 56–63 at 0.5 (fractional strength,
+exercised deliberately); audio [1, 16, 32], all-ones mask, stepped
+through the same loop because the reference steps both modalities
+with one stepper. Both stages run chained like deployment: stage 2
+initializes from a synthetic "upsampled" latent through the noiser at
+noise_scale 0.909375.
+
+Gates, pre-registered. The Zig side is a NEW host-only binary,
+//ltx:scheduler_conformance, over a reusable ltx/scheduler.zig — no
+GPU, no ZML dependency, because this is pure f32 arithmetic and the
+engine will reuse the same module between DiT calls.
+
+G-SCHED-1: the Zig comptime sigma tables vs the bundle's, bit-exact,
+zero exceptions. G-SCHED-2: per-step timesteps, bit-exact. G-SCHED-3:
+per-step denoised (the x0 conversion), bit-exact expected, with the
+RoPE-style straggler protocol (≤1 ulp, ≤0.01% count,
+coordinate-pinned) as the only fallback. G-SCHED-4: per-step
+post-processed latent, same. G-SCHED-5: per-step stepped latent, both
+stages, both modalities, same. G-SCHED-6: the stage-2 initialization
+chain, same — predicted failure mode if any: the lerp branch.
+
+H-SCHED-1: everything bit-exact, zero stragglers. Basis: elementwise
+f32 with identical operation order on both sides; Zig's default float
+semantics are strict IEEE with no contraction, and torch's vectorized
+CPU kernels use explicit non-fused intrinsics. H-SCHED-2: the
+bf16-storage trajectory diverges from f32 with step count; final-state
+rel-RMS lands in the 1e-3 to 1e-2 band (the bf16-floor scale, eight
+storage casts deep). Informative, not a gate.
+
+## 2026-08-21, night — 94/94 bit-exact, after the gate structure catches torch fusing a multiply
+
+Build notes first. The oracle generator hit upstream's own version
+skew: PyPI ltx-pipelines (1.0.0, the only release) does not actually
+import against PyPI ltx-core 1.2.0 — the pipelines package `__init__`
+wants a `decode_video` that core no longer exports, and helpers.py
+imports a `GemmaTextEncoder` that core renamed to LTXGemmaTextEncoder.
+Core 1.2.0 stays pinned (it anchors every Phase 2/3 oracle), so the
+generator loads the loop modules verbatim from their installed files
+through a bare package shim plus a one-line class alias, both disclosed
+in the script. The loop code executed is the reference's own,
+unmodified. Bundle: 126 tensors; the stepwise-driven trajectory equals
+the single-call reference loop BITWISE in both stages (the staging
+control, inherited from Phase 2); twin-captured noise reproduces the
+noiser's draws bitwise (asserted in-script).
+
+First run: 74 of 94 gates bit-exact — all of stage 1, both modalities,
+every sub-gate — and every one of the 20 failures downstream of the
+stage-2 init, starting at ~10 ulp there and inflating to ~128 ulp
+through the x0 conversion (values shrink as sigma falls; absolute
+error persists; ulp count grows). The per-step, per-stage sub-gate
+structure pointed at the exact first divergence: the stage-2
+initialization — the only place a noise-scale lerp runs with a
+NON-TRIVIAL weight. Stage 1 could never have caught it: weight 1.0
+returns the endpoint under any formula, and weight 0.5's product by a
+power of two is exact. A trajectory-level tolerance gate would have
+shrugged at 1e-7; the bit gate localized a one-ulp defect to one
+function.
+
+Forensics, one element deep: torch.lerp's output bit-matches
+fma(−(b−a), 1−w, b) — a FUSED multiply-add, single rounding — not the
+two-rounding formula written in ATen's Lerp.h, which is what I read
+and registered. The header's scalar reference is not what the
+vectorized CPU tensor kernel executes. Confirmed over 2000 random
+pairs per branch, both branches FMA-formed, bitwise. G-SCHED-6's
+registered failure prediction said "the lerp branch" — right organ,
+wrong lesion: the fusion, not the branch select. Fix: @mulAdd in
+ltx/scheduler.zig's lerp, both branches.
+
+Re-run: **94/94 gates bit-exact, zero stragglers, zero tolerated
+diffs.** H-SCHED-1 confirmed as registered. H-SCHED-2 also landed:
+bf16-storage finals diverge from f32 at rel-RMS 3.63e-3 (video) and
+3.97e-3 (audio), inside the predicted 1e-3..1e-2 band — that is the
+deployment floor the engine's latents inherit if stored bf16.
+
+What the receipts now cover: the hardcoded distilled sigma constants;
+per-token timesteps versus scalar-sigma stepping (the conditioning
+asymmetry); the mask blend; the no-snap final step (divide and
+multiply through sigma_next = 0, rounding included); and the noiser's
+fused two-branch lerp — all reproduced bit-for-bit by
+ltx/scheduler.zig, the module the engine will run between DiT calls.
+
+Registered for the future, extending the E3w lesson from this morning:
+a "same math" claim must name the KERNEL, not the formula — the
+formula in the reference's header and the instructions its kernel
+executes differed by one fused rounding, and only a bit-exact gate
+distinguishes them. Phase 3 item two of three is CLOSED. Next: the
+streaming loader, with upstream's own block_streaming package
+(discovered during this read) as prior art to compare against the
+design note before building.

@@ -32,9 +32,12 @@ int8-quantized block sits at the reference's own bf16 deployment
 floor. Also learned the hard way: naive device-to-host readback runs
 at ~0.5 GB/s, so everything stays on device until the final frames.
 Attention geometry is verified against LTX-2.5's own code (32 heads ×
-128, 48 layers). Next: the distilled scheduler compared
-update-by-update, then the streaming loader (~20 GB DiT through a
-15 GB-RAM machine), then 48-block assembly. The journal at
+128, 48 layers), and the distilled denoising loop is reproduced
+**bit-exactly** — 94/94 gates against the reference pipeline's own
+loop code, down to the fused multiply-add inside torch's lerp kernel
+that its own reference header doesn't show. Next: the streaming loader
+(~20 GB DiT through a 15 GB-RAM machine), then 48-block assembly. The
+journal at
 [docs/lab-notebook.md](docs/lab-notebook.md) is
 the source of truth — it logs the why behind each decision, with
 hypotheses written down before the measurements, including the ones

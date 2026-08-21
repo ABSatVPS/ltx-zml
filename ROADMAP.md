@@ -73,11 +73,13 @@ Landed so far: the 0/23/47 chain conforms with sub-linear error growth
 (2.68e-6 at three blocks); the quantization recipe is settled
 (int8-g128 large projections, fully quantized block at the bf16
 floor); the streaming loader is designed (notebook, ring-lifecycle
-contract); and the E3w while-loop attention — the only attention that
-fits at T≈28k — is swapped into the block path and gated: agreement
-with dense 1.09e-6, oracle conformance unchanged (1.80e-6 block,
-2.68e-6 chain). Remaining: the scheduler compared update-by-update,
-the streaming loader build, then 48-block assembly.
+contract); the E3w while-loop attention — the only attention that
+fits at T≈28k — is swapped into the block path and gated (agreement
+with dense 1.09e-6, oracle conformance unchanged); and the distilled
+scheduler is reproduced BIT-EXACTLY by ltx/scheduler.zig — 94/94
+gates across both stages, both modalities, every update — including
+the fused-lerp kernel semantics the reference's own header doesn't
+show. Remaining: the streaming loader build, then 48-block assembly.
 
 Done means: latents for a fixed seed and fixed precomputed conditioning
 match the reference pipeline's within tolerance, step by step, and a
