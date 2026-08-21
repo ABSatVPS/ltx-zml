@@ -1539,3 +1539,84 @@ distinguishes them. Phase 3 item two of three is CLOSED. Next: the
 streaming loader, with upstream's own block_streaming package
 (discovered during this read) as prior art to compare against the
 design note before building.
+
+## 2026-08-21, late night — upstream's own streaming loader, read as prior art
+
+Our streaming design note was written before discovering that ltx-core
+ships a block_streaming package (1,625 lines: pool, provider, source,
+disk, stream_sync, wrapper, builder). Reading it before building is
+free risk reduction — either it validates the design or it teaches
+something. It did both.
+
+What upstream built. Two modes: RAM streaming (every block pre-loaded
+into pinned CPU buffers — assumes the model fits in host RAM, which
+ours does not) and disk streaming (a background worker thread reads
+blocks from safetensors — which mmap, so the page cache does the disk
+caching — into a small pool of pinned CPU slots, default TWO slots
+plus a prefetch-depth lookahead). GPU side: a fixed pool of slots
+carved from ONE contiguous device allocation; each block's tensors
+are laid out contiguously in one blob, so landing a block is a SINGLE
+H2D byte copy, and per-key tensor views are carved from the raw slot
+afterward. Ordering: a dedicated copy stream with cross-stream events
+enforcing exactly two invariants — copy-before-compute, and
+compute-before-slot-reuse. Blocks stream via forward pre/post hooks;
+the overlap comes not from explicit H2D lookahead but from Python
+enqueuing GPU work asynchronously and running ahead of the device, so
+block i+1's copy is in flight while block i's kernels still execute.
+
+Where it validates the design note: the staging chain is IDENTICAL
+(mmap page cache → pinned host slots → device slots → compute); the
+two event orderings are exactly our ring lifecycle invariants under
+different bookkeeping; and their single-slab-carved-into-fixed-slots
+allocation is a stronger form of our "uniform geometry cannot
+fragment" argument. The disk mode's tiny CPU pool (two slots plus
+lookahead) confirms the pinned ring does not need depth — the page
+cache absorbs the variance.
+
+Two adoptions, folded into the design as of tonight. First: ONE BLOB
+PER BLOCK. Our quantized tensors currently live as ~30 files per
+block; the loader wants each block packed into a single contiguous
+byte blob with a fixed manifest-defined layout, landed with one DMA,
+views carved after. A small pack step joins the tooling before the
+build. Second: overlap via asynchronous enqueue depth rather than an
+explicit prefetch state — IF the PJRT execute path is asynchronous
+under ZML the same free overlap applies; that is now a question to
+answer by measurement, not assumption.
+
+Where we still differ, deliberately: upstream's RAM mode is
+unavailable to us (15 GB host, ~20 GB model — the page-cache overflow
+design stays); we stream our own int8-g128 blobs, not bf16
+safetensors; PJRT owns the device allocator, so our "slab" is N
+identical preallocated buffers rather than carved raw memory; and the
+schedule being compile-time constant, the whole slot state machine
+gets verified as a static cycle at startup — the agent-memory
+discipline upstream's event bookkeeping does not attempt.
+
+Pre-registered build rungs (the last Phase 3 pre-assembly item):
+
+E-STREAM-1, transfer audit: measure ZML/PJRT host-to-device rate for
+one block-sized blob (~425 MB at int8: 20 GB / 48) from pageable
+memory and from whatever pinned path ZML exposes. Hypothesis: pageable
+lands in the low single-digit GB/s (the readback pathology, reversed,
+suggested ~0.5 GB/s is possible but upload usually fares better);
+pinned multiplies that severalfold. Decision rule: even the WORST
+plausible rate hides under today's ~60 s/step compute — the loader
+cannot be the current bottleneck; what the measurement actually
+decides is headroom for the perf pass's 2×+ attention and time-to-
+first-block.
+
+E-STREAM-2, overlap: does an upload proceed while an executable runs?
+Measure wall time of compute-plus-upload issued together vs summed
+serially. Hypothesis: ZML's call path is asynchronous enough that the
+upstream free-overlap trick applies; if it is not, the loader gets
+its own thread and the invariants stay identical.
+
+E-STREAM-3, the ring: three device slots cycling 48 synthetic blocks
+fed by a two-slot pinned host ring and an mmap reader thread, slot
+states (filling → ready → in-use → free) asserted on every
+transition, the full 48-block schedule verified as a static cycle at
+startup before any I/O. Measured: steady-state stall per block
+(hypothesis: ~zero once warm at current compute speeds).
+
+Then the loader meets the 48-block assembly, which is the next phase
+checkpoint after these rungs.
