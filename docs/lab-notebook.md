@@ -573,8 +573,8 @@ modules onto a GPU left in a bad state, almost certainly by run 7's
 deliberate back-to-back VRAM exhaustions (E3-unrolled OOM at T=16384,
 then E2-naive marching into its own 17 GiB allocation failure). The
 agent session hosting the run died with it — on a 15 GiB-RAM machine
-also carrying VS Code and, later, an 8-thread LAMMPS simulation, the
-margins are thin. Forensics after the fact: GPU back to ~500 MB used
+also carrying an IDE and, later, a heavy multi-threaded compute job
+from an unrelated project, the margins are thin. Forensics after the fact: GPU back to ~500 MB used
 and 2% busy once the stuck process was gone — the wedge was process
 state, not hardware. No reboot was needed.
 
@@ -591,7 +591,7 @@ from now on.
 
 Run 8b retries E3w by executing the already-built binary directly —
 no bazel server (a few GB of RAM returned), `nice -n 10`, sharing the
-machine with the LAMMPS run. Benchmark-environment note: run 8b's CPU-
+machine with that unrelated job. Benchmark-environment note: run 8b's CPU-
 side timings carry that load; the E3w question (does the while loop's
 bounded live set survive T=16384 and 28672) is load-independent, and
 GPU-side p50s should be only mildly noisy. The run 8 prediction carries
@@ -600,8 +600,8 @@ over unchanged.
 ## 2026-08-20, evening — run 8b: E3w confirmed on every count
 
 Run 8b (prebuilt binary, no bazel server, nice 10, sharing the machine
-with the chimera-autoresearch LAMMPS loop — which, it turns out, was
-the mystery load, cycling a new simulation every ~25 minutes) delivered
+with an unrelated scheduled compute loop — which, it turns out, was
+the mystery load, cycling a new job every ~25 minutes) delivered
 the E3w verdict:
 
 Correctness: while-vs-unrolled rms at T=1024 is **0.00000** — bit-
@@ -629,7 +629,7 @@ at current efficiency — minutes per clip on the distilled model before
 optimization. Known headroom, in order: f16 scores (~2× — today the
 chunk scores round-trip VRAM in f32), Q-tiling, and head-batching the
 two GEMMs per chunk harder. Also noted: run 8b's numbers were ~15%
-BETTER than run 7's despite the LAMMPS load — run-to-run variance on
+BETTER than run 7's despite the shared load — run-to-run variance on
 this card is real; comparisons should stay within-run.
 
 Hygiene applied: the naive E2 sweep now stops before its known OOM
