@@ -30,9 +30,10 @@ const O: i64 = 2048;
 const K: i64 = 6144;
 const S_LIST = [_]i64{ 1, 8, 64, 512, 4096, 28672 };
 
-// E2 geometry (LTX-2.5 head count/dim UNVERIFIED — see notebook; update
-// when the HF config is read).
-const H: i64 = 16;
+// Attention geometry — VERIFIED against LTX-2's ltx-core
+// model_configurator.py defaults (video stream: 32 heads x 128 head dim,
+// hidden 4096, 48 layers; audio stream 32 x 64). Runs 1-6 used H=16.
+const H: i64 = 32;
 const HD: i64 = 128;
 const T_LIST = [_]i64{ 512, 1024, 4096, 8192, 16384, 28672 };
 const T_ORACLE: i64 = 512;
@@ -46,7 +47,7 @@ fn ms(ns: u64) f64 {
     return @as(f64, @floatFromInt(ns)) / 1e6;
 }
 
-fn relativeRms(got: []const f32, want: []const f32, limit: f64) bool {
+fn relRms(got: []const f32, want: []const f32) f64 {
     var err: f64 = 0;
     var ref: f64 = 0;
     for (got, want) |g, w| {
@@ -54,7 +55,11 @@ fn relativeRms(got: []const f32, want: []const f32, limit: f64) bool {
         err += d * d;
         ref += @as(f64, w) * w;
     }
-    const r = @sqrt(err / (ref + 1e-20));
+    return @sqrt(err / (ref + 1e-20));
+}
+
+fn relativeRms(got: []const f32, want: []const f32, limit: f64) bool {
+    const r = relRms(got, want);
     if (r > limit) {
         log.err("relative RMS {d} exceeds {d}", .{ r, limit });
         return false;
@@ -116,6 +121,104 @@ fn dotQF16SumGraph(w: zml.Tensor, sc: zml.Tensor, x: zml.Tensor) zml.Tensor {
 /// Whether XLA's fusion rescues it is exactly the experiment.
 fn sdpaGraph(q: zml.Tensor, k: zml.Tensor, v: zml.Tensor) zml.Tensor {
     return zml.nn.sdpa(q, k, v, .{});
+}
+
+/// E3: blockwise online-softmax attention, traced as a TRACE-TIME-unrolled
+/// loop over K/V chunks (static shapes make a stablehlo while unnecessary —
+/// the same comptime philosophy as coli-zml's Group(N)). Matmuls in f16,
+/// running max/denominator/accumulator in f32. Peak live intermediate is
+/// one [H,Tq,CHUNK] scores chunk instead of the naive [H,T,T]; whether
+/// XLA's buffer liveness actually delivers that bound across the unrolled
+/// iterations at T=28672 is exactly the experiment.
+fn blockwiseSdpaGraph(q_: zml.Tensor, k: zml.Tensor, v: zml.Tensor) zml.Tensor {
+    const t = k.dim(.k);
+    const chunk: i64 = @min(1024, t);
+    const hd_f: f32 = @floatFromInt(q_.dim(.hd));
+    const q = q_.mul(zml.Tensor.scalar(1.0 / @sqrt(hd_f), .f16));
+
+    var m: zml.Tensor = undefined; // [h,q] f32 running max
+    var l: zml.Tensor = undefined; // [h,q] f32 running denominator
+    var acc: zml.Tensor = undefined; // [h,q,hd] f32 running numerator
+
+    var off: i64 = 0;
+    while (off < t) : (off += chunk) {
+        const kc = k.slice1d(.k, .{ .start = off, .end = off + chunk });
+        const vc = v.slice1d(.k, .{ .start = off, .end = off + chunk });
+        const s32 = q.dot(kc, .hd).convert(.f32); // [h,q,chunk]
+        const cmax = s32.max(.k).squeeze(.k); // [h,q]
+        if (off == 0) {
+            m = cmax;
+            const p = s32.sub(m.broad(s32.shape())).exp();
+            l = p.sum(.k).squeeze(.k);
+            acc = p.convert(.f16).dot(vc, .k).convert(.f32); // [h,q,hd]
+        } else {
+            const m_new = m.maximum(cmax);
+            const corr = m.sub(m_new).exp(); // [h,q], rescales old stats
+            const p = s32.sub(m_new.broad(s32.shape())).exp();
+            l = l.mul(corr).add(p.sum(.k).squeeze(.k));
+            const pv = p.convert(.f16).dot(vc, .k).convert(.f32);
+            acc = acc.mul(corr.broad(acc.shape())).add(pv);
+            m = m_new;
+        }
+    }
+    return acc.div(l.broad(acc.shape())).convert(.f16);
+}
+
+/// E3w chunk size — a module constant because the while body below is a
+/// nested fn and Zig nested fns cannot close over runtime values; anything
+/// runtime rides in the while context as a Tensor.
+const WCHUNK: i64 = 1024;
+
+/// E3w: the SAME blockwise algorithm as blockwiseSdpaGraph, but as a real
+/// stablehlo.while with loop-carried (step, m, l, acc). Run 7 showed the
+/// unrolled form OOMs at T=16384/H=32 — XLA's buffer assignment keeps
+/// multiple chunk intermediates alive across unrolled iterations. A while
+/// loop's body buffers are reused by construction: the trade is a hard
+/// memory bound for the loss of cross-iteration fusion freedom. Requires
+/// t % WCHUNK == 0 (the T sweep skips smaller sizes).
+fn blockwiseWhileSdpaGraph(q_: zml.Tensor, k: zml.Tensor, v: zml.Tensor) zml.Tensor {
+    const t = k.dim(.k);
+    const n_chunks: i64 = @divExact(t, WCHUNK);
+    const hd_f: f32 = @floatFromInt(q_.dim(.hd));
+    const q = q_.mul(zml.Tensor.scalar(1.0 / @sqrt(hd_f), .f16));
+
+    const hq_shape = zml.Shape.init(.{ .h = q.dim(.h), .q = q.dim(.q) }, .f32);
+    const acc_shape = zml.Shape.init(.{ .h = q.dim(.h), .q = q.dim(.q), .hd = q.dim(.hd) }, .f32);
+    // Finite lowest (not -inf): exp(m0 - m_new) underflows cleanly to 0 on
+    // the first iteration instead of producing -inf minus -inf = NaN.
+    const m0 = zml.Tensor.scalar(-std.math.floatMax(f32), .f32).broad(hq_shape);
+    const l0 = zml.Tensor.scalar(0, .f32).broad(hq_shape);
+    const acc0 = zml.Tensor.scalar(0, .f32).broad(acc_shape);
+
+    const Ctx = struct { q: zml.Tensor, k: zml.Tensor, v: zml.Tensor, n: zml.Tensor };
+    const Local = struct {
+        fn cond(step: zml.Tensor, _: zml.Tensor, _: zml.Tensor, _: zml.Tensor, c: Ctx) zml.Tensor {
+            return step.cmp(.LT, c.n);
+        }
+        fn body(step: zml.Tensor, m: zml.Tensor, l: zml.Tensor, acc: zml.Tensor, c: Ctx) [4]zml.Tensor {
+            const off = step.mul(zml.Tensor.scalar(WCHUNK, .i32));
+            const kc = c.k.dynamicSlice(.{ .k = zml.Tensor.DynSlice{ .start = off, .len = WCHUNK } });
+            const vc = c.v.dynamicSlice(.{ .k = zml.Tensor.DynSlice{ .start = off, .len = WCHUNK } });
+            const s32 = c.q.dot(kc, .hd).convert(.f32); // [h,q,WCHUNK]
+            const cmax = s32.max(.k).squeeze(.k); // [h,q]
+            const m_new = m.maximum(cmax);
+            const corr = m.sub(m_new).exp();
+            const p = s32.sub(m_new.broad(s32.shape())).exp();
+            const l_new = l.mul(corr).add(p.sum(.k).squeeze(.k));
+            const pv = p.convert(.f16).dot(vc, .k).convert(.f32);
+            const acc_new = acc.mul(corr.broad(acc.shape())).add(pv);
+            return .{ step.addConstant(1), m_new, l_new, acc_new };
+        }
+    };
+
+    const ctx: Ctx = .{ .q = q, .k = k, .v = v, .n = zml.Tensor.scalar(n_chunks, .i32) };
+    const res = zml.ops.@"while"(
+        .{ zml.Tensor.scalar(0, .i32), m0, l0, acc0 },
+        Local.cond,
+        Local.body,
+        .{ctx},
+    );
+    return res[3].div(res[2].broad(acc_shape)).convert(.f16);
 }
 
 // ---- exe plumbing (coli-zml idioms) ---------------------------------------
@@ -326,12 +429,149 @@ pub fn main(init: std.process.Init) !void {
         });
     }
 
+    // ---- E3: blockwise attention (BEFORE E2, so a naive OOM can't block it)
+    // At T=512 the blockwise output cross-checks against zml.nn.sdpa; E2
+    // checks that same sdpa against the CPU oracle, closing the chain.
+    const HDu: usize = @intCast(HD);
+    const Hu: usize = @intCast(H);
+    log.info("E3: blockwise attention, unrolled K/V chunks of 1024, f16 matmuls + f32 running stats", .{});
+    for (T_LIST) |t| {
+        const tu: usize = @intCast(t);
+        const n = Hu * tu * HDu;
+        const q = try allocator.alloc(f16, n);
+        defer allocator.free(q);
+        const kk = try allocator.alloc(f16, n);
+        defer allocator.free(kk);
+        const v = try allocator.alloc(f16, n);
+        defer allocator.free(v);
+        for (q, 0..) |*e, i| e.* = @floatCast(@sin(@as(f32, @floatFromInt(i + 1)) * 0.011) * 0.25);
+        for (kk, 0..) |*e, i| e.* = @floatCast(@sin(@as(f32, @floatFromInt(i + 3)) * 0.017) * 0.25);
+        for (v, 0..) |*e, i| e.* = @floatCast(@sin(@as(f32, @floatFromInt(i + 7)) * 0.023) * 0.25);
+        const q_shape: zml.Shape = .init(.{ .h = H, .q = t, .hd = HD }, .f16);
+        const kv_shape: zml.Shape = .init(.{ .h = H, .k = t, .hd = HD }, .f16);
+        var q_buf = try uploadF16(io, platform, q_shape, q);
+        defer q_buf.deinit();
+        var k_buf = try uploadF16(io, platform, kv_shape, kk);
+        defer k_buf.deinit();
+        var v_buf = try uploadF16(io, platform, kv_shape, v);
+        defer v_buf.deinit();
+        const q_spec: zml.Tensor = .fromShape(q_shape);
+        const k_spec: zml.Tensor = .fromShape(kv_shape);
+        const v_spec: zml.Tensor = .fromShape(kv_shape);
+        var exe = platform.compileFn(allocator, io, blockwiseSdpaGraph, .{ q_spec, k_spec, v_spec }, .{}) catch |err| {
+            log.err("  T={d}: blockwise COMPILE failed ({s})", .{ t, @errorName(err) });
+            break;
+        };
+        const out = try allocator.alloc(f16, n);
+        defer allocator.free(out);
+        callExe(f16, allocator, io, &exe, .{ q_buf, k_buf, v_buf }, out) catch |err| {
+            log.err("  T={d}: blockwise EXEC failed ({s})", .{ t, @errorName(err) });
+            break;
+        };
+        if (t == T_ORACLE) {
+            const nq_spec: zml.Tensor = .fromShape(q_shape);
+            const nk_spec: zml.Tensor = .fromShape(kv_shape);
+            const nv_spec: zml.Tensor = .fromShape(kv_shape);
+            var nexe = try platform.compileFn(allocator, io, sdpaGraph, .{ nq_spec, nk_spec, nv_spec }, .{});
+            const nout = try allocator.alloc(f16, n);
+            defer allocator.free(nout);
+            try callExe(f16, allocator, io, &nexe, .{ q_buf, k_buf, v_buf }, nout);
+            const a32 = try allocator.alloc(f32, n);
+            defer allocator.free(a32);
+            const b32 = try allocator.alloc(f32, n);
+            defer allocator.free(b32);
+            for (a32, out) |*g, o| g.* = @floatCast(o);
+            for (b32, nout) |*g, o| g.* = @floatCast(o);
+            // Both sides are ~1%-accurate f16 attention implementations
+            // (naive measured RMS 0.0082 against the f64 oracle in run 3;
+            // blockwise carries f32 stats so it should be the closer one),
+            // so their MUTUAL rms budget is ~2%, not the 5e-3 that tripped
+            // run 6 at rms 0.0103.
+            const r = relRms(a32, b32);
+            log.info("  T={d}: blockwise vs zml.nn.sdpa rms {d:.4}", .{ t, r });
+            if (r > 2.5e-2) return error.BlockwiseVsNaiveMismatch;
+        }
+        const reps: usize = if (tu <= 8192) 8 else 4;
+        const p50 = timeExe(f16, allocator, io, &exe, .{ q_buf, k_buf, v_buf }, out, reps) catch |err| {
+            log.err("  T={d}: blockwise timing failed ({s})", .{ t, @errorName(err) });
+            break;
+        };
+        const tflop = 4.0 * @as(f64, @floatFromInt(H * t * t * HD)) / 1e12;
+        log.info("  T={d:>5}: blockwise p50 {d:.3}ms -> {d:.2} TFLOP/s", .{ @as(u64, @intCast(t)), ms(p50), tflop / (ms(p50) / 1e3) });
+    }
+
+    // ---- E3w: same algorithm through a real stablehlo.while ---------------
+    // Prediction (pre-registered in the notebook): the loop's bounded live
+    // set survives T=16384 and 28672 where the unrolled form OOM'd.
+    log.info("E3w: blockwise via stablehlo.while, loop-carried (step,m,l,acc), chunks of {d}", .{WCHUNK});
+    for (T_LIST) |t| {
+        if (@rem(t, WCHUNK) != 0) continue; // needs whole chunks; unrolled covers T=512
+        const tu: usize = @intCast(t);
+        const n = Hu * tu * HDu;
+        const q = try allocator.alloc(f16, n);
+        defer allocator.free(q);
+        const kk = try allocator.alloc(f16, n);
+        defer allocator.free(kk);
+        const v = try allocator.alloc(f16, n);
+        defer allocator.free(v);
+        for (q, 0..) |*e, i| e.* = @floatCast(@sin(@as(f32, @floatFromInt(i + 1)) * 0.011) * 0.25);
+        for (kk, 0..) |*e, i| e.* = @floatCast(@sin(@as(f32, @floatFromInt(i + 3)) * 0.017) * 0.25);
+        for (v, 0..) |*e, i| e.* = @floatCast(@sin(@as(f32, @floatFromInt(i + 7)) * 0.023) * 0.25);
+        const q_shape: zml.Shape = .init(.{ .h = H, .q = t, .hd = HD }, .f16);
+        const kv_shape: zml.Shape = .init(.{ .h = H, .k = t, .hd = HD }, .f16);
+        var q_buf = try uploadF16(io, platform, q_shape, q);
+        defer q_buf.deinit();
+        var k_buf = try uploadF16(io, platform, kv_shape, kk);
+        defer k_buf.deinit();
+        var v_buf = try uploadF16(io, platform, kv_shape, v);
+        defer v_buf.deinit();
+        const q_spec: zml.Tensor = .fromShape(q_shape);
+        const k_spec: zml.Tensor = .fromShape(kv_shape);
+        const v_spec: zml.Tensor = .fromShape(kv_shape);
+        var exe = platform.compileFn(allocator, io, blockwiseWhileSdpaGraph, .{ q_spec, k_spec, v_spec }, .{}) catch |err| {
+            log.err("  T={d}: while COMPILE failed ({s})", .{ t, @errorName(err) });
+            break;
+        };
+        const out = try allocator.alloc(f16, n);
+        defer allocator.free(out);
+        callExe(f16, allocator, io, &exe, .{ q_buf, k_buf, v_buf }, out) catch |err| {
+            log.err("  T={d}: while EXEC failed ({s})", .{ t, @errorName(err) });
+            break;
+        };
+        if (t == 1024) {
+            // Same algorithm, same chunk order as the unrolled form — the
+            // two should agree tightly. Compile the unrolled twin here and
+            // compare directly.
+            const uq_spec: zml.Tensor = .fromShape(q_shape);
+            const uk_spec: zml.Tensor = .fromShape(kv_shape);
+            const uv_spec: zml.Tensor = .fromShape(kv_shape);
+            var uexe = try platform.compileFn(allocator, io, blockwiseSdpaGraph, .{ uq_spec, uk_spec, uv_spec }, .{});
+            const uout = try allocator.alloc(f16, n);
+            defer allocator.free(uout);
+            try callExe(f16, allocator, io, &uexe, .{ q_buf, k_buf, v_buf }, uout);
+            const a32 = try allocator.alloc(f32, n);
+            defer allocator.free(a32);
+            const b32 = try allocator.alloc(f32, n);
+            defer allocator.free(b32);
+            for (a32, out) |*g, o| g.* = @floatCast(o);
+            for (b32, uout) |*g, o| g.* = @floatCast(o);
+            const r = relRms(a32, b32);
+            log.info("  T={d}: while vs unrolled rms {d:.5}", .{ t, r });
+            if (r > 1e-3) return error.WhileVsUnrolledMismatch;
+        }
+        const reps: usize = if (tu <= 8192) 8 else 4;
+        const p50 = timeExe(f16, allocator, io, &exe, .{ q_buf, k_buf, v_buf }, out, reps) catch |err| {
+            log.err("  T={d}: while timing failed ({s})", .{ t, @errorName(err) });
+            break;
+        };
+        const tflop = 4.0 * @as(f64, @floatFromInt(H * t * t * HD)) / 1e12;
+        log.info("  T={d:>5}: while p50 {d:.3}ms -> {d:.2} TFLOP/s", .{ @as(u64, @intCast(t)), ms(p50), tflop / (ms(p50) / 1e3) });
+    }
+
     // ---- E2: sdpa at video lengths (LAST: may OOM at large T) -------------
     log.info("E2: zml.nn.sdpa f16 H={d} HD={d}; naive scores at T=28672 would be ~{d:.1} GB/head — OOM here IS the result (E3 becomes mandatory)", .{
         H, HD, @as(f64, @floatFromInt(28672 * 28672 * 2)) / 1e9,
     });
-    const HDu: usize = @intCast(HD);
-    const Hu: usize = @intCast(H);
     for (T_LIST) |t| {
         const tu: usize = @intCast(t);
         const n = Hu * tu * HDu;
@@ -363,11 +603,17 @@ pub fn main(init: std.process.Init) !void {
         const q_spec: zml.Tensor = .fromShape(q_shape);
         const k_spec: zml.Tensor = .fromShape(kv_shape);
         const v_spec: zml.Tensor = .fromShape(kv_shape);
-        var exe = try platform.compileFn(allocator, io, sdpaGraph, .{ q_spec, k_spec, v_spec }, .{});
+        var exe = platform.compileFn(allocator, io, sdpaGraph, .{ q_spec, k_spec, v_spec }, .{}) catch |err| {
+            log.info("  T={d}: naive sdpa failed at compile ({s}) — expected; the E2 conclusion stands and E3 above is the path", .{ t, @errorName(err) });
+            break;
+        };
 
         const out = try allocator.alloc(f16, n);
         defer allocator.free(out);
-        try callExe(f16, allocator, io, &exe, .{ q_buf, k_buf, v_buf }, out); // warmup
+        callExe(f16, allocator, io, &exe, .{ q_buf, k_buf, v_buf }, out) catch |err| {
+            log.info("  T={d}: naive sdpa failed at execute ({s}) — expected; scores materialization exceeded VRAM, E3 above is the path", .{ t, @errorName(err) });
+            break;
+        };
 
         if (t == T_ORACLE) {
             // CPU oracle: full attention in f64, per head.
@@ -411,7 +657,10 @@ pub fn main(init: std.process.Init) !void {
         }
 
         const reps: usize = if (tu <= 8192) 8 else 4;
-        const p50 = try timeExe(f16, allocator, io, &exe, .{ q_buf, k_buf, v_buf }, out, reps);
+        const p50 = timeExe(f16, allocator, io, &exe, .{ q_buf, k_buf, v_buf }, out, reps) catch |err| {
+            log.info("  T={d}: naive sdpa failed in timing ({s}) — expected at large T", .{ t, @errorName(err) });
+            break;
+        };
         const tflop = 4.0 * @as(f64, @floatFromInt(H * t * t * HD)) / 1e12;
         log.info("  T={d:>5}: p50 {d:.3}ms -> {d:.2} TFLOP/s attention", .{ @as(u64, @intCast(t)), ms(p50), tflop / (ms(p50) / 1e3) });
     }

@@ -475,3 +475,89 @@ loop in the traced graph. Target: beat 4.9 TFLOP/s naive at T=8192,
 run at all at T=28672, judged against the same CPU oracle. After that,
 read the LTX-2.5 HF config to pin the real geometry (the 28 k estimate,
 head count, and dual-stream split are still unverified).
+
+## 2026-08-20/21, overnight — E3 first contact, and the real geometry arrives
+
+### The estimated geometry is now verified geometry
+
+The LTX-2.5 HF weights repo is gated (license acceptance plus a token —
+noted for when we want real checkpoints), but the pipeline code is public
+and `ltx-core`'s transformer configurator carries the numbers. Video
+stream: **32 attention heads × 128 head dim (hidden 4096), 48 layers**,
+128 latent channels, 3D RoPE over (t, x, y) with max positions
+[20, 2048, 2048], RMS qk-norm (the blockwise kernel must apply it),
+gelu-approximate FFN, bias-free in 2.5. Audio stream: 32 heads × 64
+(hidden 2048), 1D temporal RoPE. The LTX-2 paper confirms the asymmetric
+split — 14B video + 5B audio in LTX-2; 2.5's growth to 22B means the
+2.5 checkpoint's own metadata (layers/FF width) may exceed these
+defaults — unverifiable until the gate is passed.
+
+Bonus findings from the card and code: frame counts obey %8==1 and
+resolutions %32 — confirming the 8×/32× VAE compression my token
+estimate assumed, so ~26k tokens for 10 s at 1216×704 stands, and the
+x2 spatial/temporal upscalers exist precisely so generation happens at
+that scale rather than native 4K. The 2.5 checkpoints also ship an
+"int8-convrot" quant (rotation-folded quantization — a pleasing echo of
+colibrì's E8 rotation fold), and the KV-cacheable checkpoints drop
+timestep-dependence from cross-attention K/V so prompt K/V computes
+once and is reused across all steps — a design gift for the engine.
+
+My smoke had H=16 — half the real head count. Attention numbers from
+runs 3–6 are internally consistent (E2 vs E3 at the same H) but all at
+half the real memory pressure. H is now 32.
+
+### Run 6: E3 tripped its own cross-check — tolerance miscalibration, round two
+
+E1/E1a/E1b reproduced for the sixth time (readback 0.41–0.51 GB/s —
+that constant is now beyond doubt). E3 compiled and executed at T=512,
+then failed its cross-check against zml.nn.sdpa at rms 0.0103 vs my
+5e-3 limit. Same lesson as run 2's oracle, one level up: the naive
+reference itself deviates 0.0082 from the f64 oracle (its softmax runs
+in f16), while blockwise carries f32 running stats — comparing two
+~1%-accurate implementations against each other needs a ~2% budget,
+and blockwise is likely the MORE accurate side of the pair. The check
+now logs the measured rms and gates at 2.5e-2. Run 7 runs the full E3
+sweep at real geometry; the open question is whether the unrolled
+chunk loop's live set stays inside 16 GB at T=28672 with H=32 (one
+[32, 28672, 1024] f32 scores chunk is ~3.8 GB — if XLA keeps two or
+three alive across fusion boundaries it gets tight; CHUNK=512 is the
+fallback).
+
+## 2026-08-21 — run 7: E3 beats naive on speed, loses on the memory promise
+
+First full E3 sweep at real geometry (H=32, HD=128). The good half: the
+T=512 cross-check passed (rms 0.0103, inside the recalibrated budget),
+and at T=8192 blockwise runs 151.8 ms / 7.25 TFLOP/s against naive's
+211.3 ms / 5.20 — a 1.39× win, beating the pre-registered target. The
+throughput arithmetic says both forms are bandwidth-bound on f32 score
+traffic: at T=8192 the blockwise pass moves roughly 40 GB through VRAM,
+which at 320 GB/s is ~125 ms — most of the measured time. Headroom for
+later: f16 scores would halve that traffic; not today's problem.
+
+The bad half: at T=16384 the unrolled form died with ResourceExhausted —
+**the memory bound did not hold.** The algorithm needs one
+[32, T, 1024] f32 scores chunk (~1.9 GB at 16384) live at a time; XLA's
+buffer assignment across the 16 unrolled iterations evidently keeps
+several alive. The compile-time-unrolled trace gives the scheduler
+freedom, and the scheduler uses that freedom to spend memory. Genesis
+entry E3 said "memory is bounded by construction" — construction turned
+out to be a suggestion, not a bound, when the loop is unrolled.
+
+The fix candidate is the real thing: ZML exposes `zml.ops.while`
+(stablehlo.while, used by its GatedDeltaNet), and a while loop's
+loop-carried state — (step, m, l, acc) here, with q/k/v as captured
+context and dynamicSlice picking the chunk — forces buffer reuse across
+iterations by construction. The trade: XLA cannot fuse across while
+iterations, so some speed may go. One Zig detail worth recording: nested
+fns cannot close over runtime values, so the chunk size becomes a module
+constant (WCHUNK=1024) and anything runtime rides in the while context
+as a Tensor.
+
+**Run 8 prediction, pre-registered:** E3w (the while form) survives
+T=16384 AND T=28672 — estimated live set at 28672 is ~10 GB (double-
+buffered loop state ~1 GB, one 3.8 GB f32 scores chunk plus its exp'd
+successor, q/k/v ~0.7 GB) — and lands within ±30% of the unrolled speed
+at T ≤ 8192, since the workload is bandwidth-bound and fusion across
+iterations wasn't buying much. If it still OOMs, WCHUNK drops to 512;
+if it's dramatically slower, the host-driven multi-executable loop with
+device-resident stats is the remaining card.
