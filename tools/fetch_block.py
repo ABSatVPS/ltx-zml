@@ -25,6 +25,13 @@ import urllib.request
 REPO = "Lightricks/LTX-2.5"
 DEFAULT_FILE = "diffusion_models/ltx-2.5-22b-distilled-transformer-bf16.safetensors"
 
+# The revision every fetched block must come from. The original script
+# pinned whatever `main` pointed to AT FETCH TIME — fine for the first
+# fetch, silently wrong for the 45-block assembly fetch if upstream
+# moves main in between (audit finding, 2026-08-21). Pass --revision
+# main to deliberately re-resolve.
+PINNED_REVISION = "6c7e5e573ac1667efc83407806fe9b0b93730e60"
+
 # Video-stream prefixes for one block; audio and the A/V bridges are
 # Phase 7's problem and excluded from the Phase 2 bundle.
 VIDEO_KEYS = (
@@ -77,13 +84,15 @@ def main() -> int:
     ap.add_argument("outdir")
     ap.add_argument("--block", type=int, default=0)
     ap.add_argument("--file", default=DEFAULT_FILE)
+    ap.add_argument("--revision", default=PINNED_REVISION,
+                    help="commit sha to fetch from ('main' re-resolves via the API)")
     args = ap.parse_args()
     out = pathlib.Path(args.outdir)
     out.mkdir(parents=True, exist_ok=True)
 
-    # Pin the revision.
-    info = api_json(f"https://huggingface.co/api/models/{REPO}")
-    sha = info["sha"]
+    sha = args.revision
+    if sha == "main":
+        sha = api_json(f"https://huggingface.co/api/models/{REPO}")["sha"]
     url = f"https://huggingface.co/{REPO}/resolve/{sha}/{args.file}"
     print(f"revision: {sha}")
 

@@ -1825,3 +1825,58 @@ measured, ring gated end-to-end with the real graphs. What remains is
 the 48-block assembly itself: fetch and quantize the other 45 blocks,
 pack 48 blobs, stage-walk early/middle/late, then the full stream —
 every component of which now has receipts.
+
+## 2026-08-21, continued — pre-assembly audit: the map before the march
+
+Adam asked for an accurate mapping of everything before committing the
+machine to the 45-block fetch. The audit found two real defects and
+several facts worth having in writing.
+
+The system. 537 GB free on the 952 GB NVMe; the full assembly
+footprint (source bins 24 GB, int8 companions ~10 GB, dual-flavor
+blobs ~36 GB, existing state) lands around 75 GB — ample. RAM 15 GB
+with 9.3 available. GPU idle at 1%, no LAMMPS running, git clean at
+bacfc0b. The Bazel cache holds 95 GB — deliberate; cleaning it buys
+back disk at the price of a full hermetic rebuild, so it stays.
+
+The source. HF main still points at our pinned revision
+6c7e5e573ac1 — no upstream drift — and the token is live. The
+safetensors header confirms 48 transformer blocks with video-stream
+bytes EXACTLY uniform at 537,673,856 per block: the ring's
+uniform-geometry premise is now checkpoint-verified for all 48 blocks,
+not extrapolated from three. Remaining download: 45 × 537.7 MB =
+24.2 GB. The file also carries 4.89 GB of non-block tensors —
+embedders, prompt connectors, adaln heads, final projections — which
+this fetch deliberately excludes and the END-TO-END run will need;
+they are now a named later step, not a surprise.
+
+Defect one: fetch_block.py pinned whatever `main` resolved to AT FETCH
+TIME. Fine for the first fetch; silently wrong for an assembly fetch
+if upstream moved main in between — 45 blocks from a different
+revision than the three every oracle is anchored to. Fixed: --revision
+defaults to the pinned sha; re-resolving main is now an explicit act.
+
+Defect two, a wording correction against receipts: the quantization
+entries say "int8-g128 for every large projection," but the ladder's
+receipts cover qkv (both attentions) and the FFN pair — the OUTPUT
+projections were never run through a rung and remain bf16 in the
+measured 5.24e-3 configuration. The recipe as receipted: qkv + ff
+int8-g128, everything else bf16/f32. Cost of the honest version:
+64 MB per block, ~3 GB across the model — priced, accepted, and an
+out-class rung stays available as a future size play.
+
+Also mapped, filed rather than fixed: the harness QBlock uploads the
+UNUSED bf16 qkv/ff base weights alongside the quantized pairs
+(~770 MB per block moved where ~360 would do) — a lean deployment
+struct is an assembly-time item; the blobs stay dual-flavor ON
+PURPOSE so any of the 48 blocks can run the f32 conformance
+stage-walk. And a small pleasing fact: measured blob padding is zero
+— every tensor's byte size is already a multiple of 64, so blob bytes
+equal source bytes exactly.
+
+The pipeline: tools/assemble_blocks.py drives fetch → quantize (qkv,
+ff, g128 int8) → pack → digest-verify per block, resumably — a block
+counts as done only if its blob manifest records the pinned revision
+and its blob matches the recorded digest, so interruptions cost
+nothing. Skip-if-done verified against blocks 0 and 23 before launch.
+Launched for blocks 0–47; the three existing blocks skip, 45 fetch.
