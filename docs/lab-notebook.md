@@ -2285,3 +2285,50 @@ ltx/scheduler.zig's lerp chain and it must equal the oracle's
 s1_x0 EXACTLY — the fused-lerp discovery standing guard at the
 integration seam. Oracle-side control: the noise twin-capture
 assert, as in the scheduler bundle.
+
+## 2026-08-21, afternoon — T-parametrization paid off, and the production-length pre-registration
+
+While the multi-step oracle walks its 8 f64 forwards, the standing
+debt in block.zig's header ("assembly parametrizes T later") came due:
+every use of the comptime T/S consts inside traced code is now derived
+from the input tensors' dims at trace time — whileSdpa's chunk count
+from k's .k dim, every attention reshape from the tensor being
+reshaped, cross-attention K/V length from the modulated context. The
+consts remain as the conformance harness's default geometry only. The
+22-gate suite is the fence, and it reports NUMBERS IDENTICAL to the
+historical record (blockOut 1.843e-6, e3w-attn1 1.094e-6,
+quant-qBlockOutAll 5.237e-3, RoPE 0 stragglers): the refactor is
+provably invisible at T=64.
+
+### Pre-registration: the production-length pass (fits, runs, timed)
+
+What Phase 3's done-means asks at production length is different in
+kind from the harness gates: "a full denoising pass FITS and RUNS on
+the card with time-per-step recorded." A step-by-step f64 oracle at
+T=28,672 is off the table by arithmetic — one block costs ~448x the
+harness forward, ~75 min on this CPU, 2.5 days for one 48-block pass
+— so numerical authority at production length rests on the
+already-gated pieces: the 22-gate suite (including E3w agreement and
+oracle conformance), the composed harness-T pass, and the multi-step
+loop. The production run's own checks are structural: no NaN/Inf in
+the velocity, finite magnitudes logged.
+
+The build: //ltx:e2e_prod — ONE velocity pass at T=28,672 (E3's
+working length, 16-divisible for ACHUNK), wBlockOut (the E3w while
+kernel — dense scores cannot exist at this length), ring-streamed
+weights, conditioning from seeded inputs: random latent, a mask with
+0.0/0.5/1.0 stripes, sigma 0.909375, synthetic unit-circle RoPE
+tables (cos/sin of random angles — real grids are Phase 5 wiring;
+timing and stability are angle-agnostic).
+
+H-PROD-1 (fits): predicted device residency ~9-10 GB — ts9 f32
+4.23 GB (the elephant: [28672, 9, 4096]), x + block-out ~0.94 GB,
+q/k/v temps ~1.4 GB, FFN intermediate 1.88 GB, rope 0.47 GB, one
+weight set 0.54 GB — inside 16 GB without the bf16-ts9 or
+distinct-sigma-gather levers (both noted for Phase 6 if this
+prediction is wrong). H-PROD-2 (time): per-block GEMMs ~13.5 TFLOP at
+the measured 59-77 TFLOP/s plus E3w attention ~1.2 s (E3's number)
+predicts ~1.4-1.7 s/block, ~70-85 s for 48 blocks; staging 25.8 GB at
+~430 MB/s is ~60 s and for the FIRST time should hide entirely
+behind compute — reader parks near zero is the tell. Core parts add
+~1 s (the ts9 GEMM is 8.7 TFLOP). Predicted step wall: 75-120 s.

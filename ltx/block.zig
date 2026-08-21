@@ -2,8 +2,10 @@
 //! shared definition consumed by //ltx:block_conformance (its 22-gate
 //! oracle suite is this module's regression fence) and by the engine.
 //! Extracted verbatim from block_conformance.zig at the E-STREAM-3
-//! refactor (notebook 2026-08-21/22); geometry is the conformance
-//! configuration (T=64, S=32) — assembly parametrizes T later.
+//! refactor (notebook 2026-08-21/22). Since the production-length rung
+//! (2026-08-21 afternoon), all sequence geometry is derived from the
+//! input tensors' dims at trace time; the T/S consts below are only the
+//! conformance-harness defaults its binaries build their specs from.
 const std = @import("std");
 const zml = @import("zml");
 
@@ -71,12 +73,14 @@ pub const ACHUNK: i64 = 16;
 /// online-softmax algorithm. q3 [.q,.h,.hd], k3/v3 [.k,.h,.hd]; returns
 /// [.h,.q,.hd] (dot leads with batch dims).
 pub fn whileSdpa(q3: zml.Tensor, k3: zml.Tensor, v3: zml.Tensor) zml.Tensor {
-    const n_chunks: i64 = @divExact(T, ACHUNK);
+    const tq = q3.dim(.q); // trace-time; T is only the harness default
+    std.debug.assert(@rem(k3.dim(.k), ACHUNK) == 0);
+    const n_chunks: i64 = @divExact(k3.dim(.k), ACHUNK);
     const hd_f: f32 = @floatFromInt(HD);
     const k = k3.mul(zml.Tensor.scalar(1.0 / @sqrt(hd_f), .f32));
 
-    const hq_shape = zml.Shape.init(.{ .h = H, .q = T }, .f32);
-    const acc_shape = zml.Shape.init(.{ .h = H, .q = T, .hd = HD }, .f32);
+    const hq_shape = zml.Shape.init(.{ .h = H, .q = tq }, .f32);
+    const acc_shape = zml.Shape.init(.{ .h = H, .q = tq, .hd = HD }, .f32);
     // Finite lowest (not -inf): exp(m0 - m_new) underflows cleanly to 0 on
     // the first iteration instead of -inf minus -inf = NaN.
     const m0 = zml.Tensor.scalar(-std.math.floatMax(f32), .f32).broad(hq_shape);
@@ -171,6 +175,7 @@ pub const Block = struct {
     /// optional RoPE, sdpa, optional 2*sigmoid per-head gate from the
     /// attention INPUT, then output projection.
     fn attention(w: A, x: zml.Tensor, ctx: zml.Tensor, n_kv: i64, pe: ?struct { cos: zml.Tensor, sin: zml.Tensor }, comptime gated: bool, comptime algo: Algo) zml.Tensor {
+        const tq = x.dim(.t);
         var q = rmsW(lin(x, w.qw, w.qb), w.qn);
         var k = rmsW(lin(ctx, w.kw, w.kb), w.kn);
         const v = lin(ctx, w.vw, w.vb);
@@ -178,14 +183,14 @@ pub const Block = struct {
         var q3: zml.Tensor = undefined;
         var k3: zml.Tensor = undefined;
         if (pe) |p| {
-            const q4 = q.reshape(zml.Shape.init(.{ .q = T, .h = H, .p = 2, .f = 64 }, .f32));
+            const q4 = q.reshape(zml.Shape.init(.{ .q = tq, .h = H, .p = 2, .f = 64 }, .f32));
             const k4 = k.reshape(zml.Shape.init(.{ .k = n_kv, .h = H, .p = 2, .f = 64 }, .f32));
             const cos_k = p.cos.withTags(.{ .k, .h, .f });
             const sin_k = p.sin.withTags(.{ .k, .h, .f });
             q3 = rope(q4, p.cos, p.sin).withTags(.{ .q, .h, .hd });
             k3 = rope(k4, cos_k, sin_k).withTags(.{ .k, .h, .hd });
         } else {
-            q3 = q.reshape(zml.Shape.init(.{ .q = T, .h = H, .hd = HD }, .f32));
+            q3 = q.reshape(zml.Shape.init(.{ .q = tq, .h = H, .hd = HD }, .f32));
             k3 = k.reshape(zml.Shape.init(.{ .k = n_kv, .h = H, .hd = HD }, .f32));
         }
         const v3 = v.reshape(zml.Shape.init(.{ .k = n_kv, .h = H, .hd = HD }, .f32));
@@ -199,7 +204,7 @@ pub const Block = struct {
             const gate = glog.sigmoid().scale(2.0);
             out = out.mul(gate.broad(out.shape()));
         }
-        const merged = out.transpose(.{ .q, .h, .hd }).reshape(zml.Shape.init(.{ .t = T, .i = D }, .f32));
+        const merged = out.transpose(.{ .q, .h, .hd }).reshape(zml.Shape.init(.{ .t = tq, .i = D }, .f32));
         return lin(merged, w.ow, w.ob);
     }
 
@@ -218,12 +223,12 @@ pub const Block = struct {
 
     pub fn s2Attn1NoGate(self: @This(), x: zml.Tensor, ts3: zml.Tensor, cos: zml.Tensor, sin: zml.Tensor) zml.Tensor {
         const n = self.s1NormMsa(x, ts3);
-        return attention(self.attn1w(), n, n, T, .{ .cos = cos, .sin = sin }, false, .dense);
+        return attention(self.attn1w(), n, n, n.dim(.t), .{ .cos = cos, .sin = sin }, false, .dense);
     }
 
     fn attn1Out(self: @This(), x: zml.Tensor, ts3: zml.Tensor, cos: zml.Tensor, sin: zml.Tensor, comptime algo: Algo) zml.Tensor {
         const n = self.s1NormMsa(x, ts3);
-        return attention(self.attn1w(), n, n, T, .{ .cos = cos, .sin = sin }, true, algo);
+        return attention(self.attn1w(), n, n, n.dim(.t), .{ .cos = cos, .sin = sin }, true, algo);
     }
 
     pub fn s3Attn1(self: @This(), x: zml.Tensor, ts3: zml.Tensor, cos: zml.Tensor, sin: zml.Tensor) zml.Tensor {
@@ -261,7 +266,7 @@ pub const Block = struct {
         const enc = ctx.mul(scale_kv.broad(ctx.shape()).addConstant(1.0)).add(shift_kv.broad(ctx.shape()));
         // Cross-attention stays dense at every algo (pre-registered scope:
         // S=32 here, ~1k at deployment — the E3w memory argument is absent).
-        const ca = attention(self.attn2w(), attn_in, enc, S, null, true, .dense);
+        const ca = attention(self.attn2w(), attn_in, enc, enc.dim(.t), null, true, .dense);
         return ca.mul(gate_ca);
     }
 
@@ -317,8 +322,8 @@ pub const Block = struct {
         const n = self.s1NormMsa(x, ts3);
         const q = rmsW(lin(n, self.q1_w, self.q1_b), self.qn1);
         const k = rmsW(lin(n, self.k1_w, self.k1_b), self.kn1);
-        const q4 = q.reshape(zml.Shape.init(.{ .q = T, .h = H, .p = 2, .f = 64 }, .f32));
-        const k4 = k.reshape(zml.Shape.init(.{ .k = T, .h = H, .p = 2, .f = 64 }, .f32));
+        const q4 = q.reshape(zml.Shape.init(.{ .q = q.dim(.t), .h = H, .p = 2, .f = 64 }, .f32));
+        const k4 = k.reshape(zml.Shape.init(.{ .k = k.dim(.t), .h = H, .p = 2, .f = 64 }, .f32));
         const q3 = rope(q4, cos, sin).withTags(.{ .q, .h, .hd });
         const k3 = rope(k4, cos.withTags(.{ .k, .h, .f }), sin.withTags(.{ .k, .h, .f })).withTags(.{ .k, .h, .hd });
         return q3.dot(k3, .hd);
@@ -460,8 +465,8 @@ pub const QBlock = struct {
     fn qkRoped(self: @This(), n: zml.Tensor, cos: zml.Tensor, sin: zml.Tensor) struct { q3: zml.Tensor, k3: zml.Tensor } {
         const q = rmsW(linQ(n, self.q1q, self.q1s, self.base.q1_b), self.base.qn1);
         const k = rmsW(linQ(n, self.k1q, self.k1s, self.base.k1_b), self.base.kn1);
-        const q4 = q.reshape(zml.Shape.init(.{ .q = T, .h = H, .p = 2, .f = 64 }, .f32));
-        const k4 = k.reshape(zml.Shape.init(.{ .k = T, .h = H, .p = 2, .f = 64 }, .f32));
+        const q4 = q.reshape(zml.Shape.init(.{ .q = q.dim(.t), .h = H, .p = 2, .f = 64 }, .f32));
+        const k4 = k.reshape(zml.Shape.init(.{ .k = k.dim(.t), .h = H, .p = 2, .f = 64 }, .f32));
         return .{
             .q3 = rope(q4, cos, sin).withTags(.{ .q, .h, .hd }),
             .k3 = rope(k4, cos.withTags(.{ .k, .h, .f }), sin.withTags(.{ .k, .h, .f })).withTags(.{ .k, .h, .hd }),
@@ -481,11 +486,11 @@ pub const QBlock = struct {
         const n = self.base.s1NormMsa(x, ts3);
         const qk = self.qkRoped(n, cos, sin);
         const v = linQ(n, self.v1q, self.v1s, self.base.v1_b);
-        const v3 = v.reshape(zml.Shape.init(.{ .k = T, .h = H, .hd = HD }, .f32));
+        const v3 = v.reshape(zml.Shape.init(.{ .k = v.dim(.t), .h = H, .hd = HD }, .f32));
         var out = zml.nn.sdpa(qk.q3, qk.k3, v3, .{});
         const glog = lin(n, self.base.g1_w, self.base.g1_b).withTags(.{ .q, .h });
         out = out.mul(glog.sigmoid().scale(2.0).broad(out.shape()));
-        const merged = out.transpose(.{ .q, .h, .hd }).reshape(zml.Shape.init(.{ .t = T, .i = D }, .f32));
+        const merged = out.transpose(.{ .q, .h, .hd }).reshape(zml.Shape.init(.{ .t = n.dim(.t), .i = D }, .f32));
         return lin(merged, self.base.o1_w, self.base.o1_b);
     }
 
@@ -517,13 +522,13 @@ pub const QBlock = struct {
         const q = rmsW(linQ(attn_in, self.q2q, self.q2s, b.q2_b), b.qn2);
         const k = rmsW(linQ(enc, self.k2q, self.k2s, b.k2_b), b.kn2);
         const v = linQ(enc, self.v2q, self.v2s, b.v2_b);
-        const q3 = q.reshape(zml.Shape.init(.{ .q = T, .h = H, .hd = HD }, .f32));
-        const k3 = k.reshape(zml.Shape.init(.{ .k = S, .h = H, .hd = HD }, .f32));
-        const v3 = v.reshape(zml.Shape.init(.{ .k = S, .h = H, .hd = HD }, .f32));
+        const q3 = q.reshape(zml.Shape.init(.{ .q = q.dim(.t), .h = H, .hd = HD }, .f32));
+        const k3 = k.reshape(zml.Shape.init(.{ .k = k.dim(.t), .h = H, .hd = HD }, .f32));
+        const v3 = v.reshape(zml.Shape.init(.{ .k = v.dim(.t), .h = H, .hd = HD }, .f32));
         var ca = zml.nn.sdpa(q3, k3, v3, .{});
         const glog = lin(attn_in, b.g2_w, b.g2_b).withTags(.{ .q, .h });
         ca = ca.mul(glog.sigmoid().scale(2.0).broad(ca.shape()));
-        const merged = ca.transpose(.{ .q, .h, .hd }).reshape(zml.Shape.init(.{ .t = T, .i = D }, .f32));
+        const merged = ca.transpose(.{ .q, .h, .hd }).reshape(zml.Shape.init(.{ .t = attn_in.dim(.t), .i = D }, .f32));
         const ca_out = lin(merged, b.o2_w, b.o2_b).mul(gate_ca);
         const x_ca = x_sa.add(ca_out);
         const shift_mlp = adaVal(b.sst, ts3, 3);
@@ -551,13 +556,13 @@ pub const QBlock = struct {
         const q = rmsW(linQ(attn_in, self.q2q, self.q2s, b.q2_b), b.qn2);
         const k = rmsW(linQ(enc, self.k2q, self.k2s, b.k2_b), b.kn2);
         const v = linQ(enc, self.v2q, self.v2s, b.v2_b);
-        const q3 = q.reshape(zml.Shape.init(.{ .q = T, .h = H, .hd = HD }, .f32));
-        const k3 = k.reshape(zml.Shape.init(.{ .k = S, .h = H, .hd = HD }, .f32));
-        const v3 = v.reshape(zml.Shape.init(.{ .k = S, .h = H, .hd = HD }, .f32));
+        const q3 = q.reshape(zml.Shape.init(.{ .q = q.dim(.t), .h = H, .hd = HD }, .f32));
+        const k3 = k.reshape(zml.Shape.init(.{ .k = k.dim(.t), .h = H, .hd = HD }, .f32));
+        const v3 = v.reshape(zml.Shape.init(.{ .k = v.dim(.t), .h = H, .hd = HD }, .f32));
         var ca = zml.nn.sdpa(q3, k3, v3, .{});
         const glog = lin(attn_in, b.g2_w, b.g2_b).withTags(.{ .q, .h });
         ca = ca.mul(glog.sigmoid().scale(2.0).broad(ca.shape()));
-        const merged = ca.transpose(.{ .q, .h, .hd }).reshape(zml.Shape.init(.{ .t = T, .i = D }, .f32));
+        const merged = ca.transpose(.{ .q, .h, .hd }).reshape(zml.Shape.init(.{ .t = attn_in.dim(.t), .i = D }, .f32));
         const ca_out = lin(merged, b.o2_w, b.o2_b).mul(gate_ca);
         const x_ca = x_sa.add(ca_out);
         // ffn (f32 this rung)
