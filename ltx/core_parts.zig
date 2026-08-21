@@ -127,6 +127,16 @@ pub const CoreParts = struct {
         return lin(silu(e), self.pada_out_w, self.pada_out_b);
     }
 
+    /// ts9 in the block executable's input layout [.t, .n=9, .i=D].
+    pub fn ts9r(self: @This(), t: zml.Tensor) zml.Tensor {
+        return self.ts9(t).splitAxis(.i, .{ .n = 9, .i = D });
+    }
+
+    /// pts2 in the block executable's input layout [.n=2, .i=D].
+    pub fn pts2r(self: @This(), sg: zml.Tensor) zml.Tensor {
+        return self.pts2(sg).squeeze(.t).splitAxis(.i, .{ .n = 2, .i = D });
+    }
+
     pub fn patchify(self: @This(), latent: zml.Tensor) zml.Tensor {
         return lin(latent, self.pat_w, self.pat_b);
     }

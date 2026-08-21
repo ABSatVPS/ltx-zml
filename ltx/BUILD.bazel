@@ -82,6 +82,22 @@ zig_binary(
     ],
 )
 
+# H-CORE-5: the E2E composition at harness T — patchify -> adaln-driven
+# 48 ring-streamed blocks -> LayerNorm tail, vs the f64 e2e bundle.
+zig_binary(
+    name = "e2e_walk",
+    main = "e2e_walk.zig",
+    srcs = [
+        "block.zig",
+        "core_parts.zig",
+        "loader.zig",
+    ],
+    visibility = ["//visibility:public"],
+    deps = [
+        "//zml",
+    ],
+)
+
 # E-STREAM-3: the streaming ring's three-block dry run (0/23/47).
 zig_binary(
     name = "ring_dryrun",

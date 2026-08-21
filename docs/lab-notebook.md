@@ -2200,3 +2200,45 @@ conformant. Next rung, H-CORE-5 as pre-registered: the composition —
 patchify -> adaln-driven 48 streamed blocks -> tail at harness T=64
 against a full-forward f64 oracle (extending the walk bundle), budget
 2e-3, expectation ~1.5e-5 carried from the stage-walk.
+
+### H-CORE-5: the composed video-only forward PASSES at harness T
+
+Built tools/make_e2e_bundle.py (f64 oracle: patchify → adaln-driven
+48-block chain → tail, blocks loaded one at a time as in the walk
+bundle) and //ltx:e2e_walk (the engine composition: 5 executables —
+patchify, ts9r, pts2r, tail, ONE block called 48x — with every
+activation and conditioning tensor produced and consumed ON DEVICE,
+weights ring-streamed). The oracle's inputs are the core bundle's, so
+its first act is to reproduce the core dumps byte-for-byte (x0, ts9,
+pts2, tail — all four controls held), binding the two bundles.
+
+Engine vs oracle, budget 2e-3: x0 2.029e-7 · b23 2.376e-6 · b47
+5.035e-5 · final velocity 8.394e-5. ALL PASS. 69 s wall for the
+48-block walk at T=64, staging-dominated as expected.
+
+The expectation (~1.5e-5, carried from the stage-walk) was missed by
+5.6x, and the miss has a mechanism worth recording: the stage-walk
+ran on SEEDED RANDOM timestep chunks (rms ~0.1), under which error
+plateaued; the real adaln conditioning produces ts9 with rms ~1 and
+drives the residual stream to max_abs 4030 / rms 59 by block 47 (the
+oracle's own dumps; the harness walk stayed far smaller). Under real
+conditioning the error GROWS with depth — 2.4e-6 at b23 to 5.0e-5 at
+b47 — rather than plateauing. Same engine, same blocks, same budget
+margin (24x under), but "error plateaus with depth" is now known to
+be a property of the RANDOM-conditioning regime, not of the network.
+Filed as the number to watch when production-length runs land: if
+growth continues past 48 calls x multiple denoising steps, the 2e-3
+budget is the fence that matters, and the scheduler's x0-space
+round-trip renormalizes between steps anyway.
+
+Also recorded: the tail is where the magnitude story resolves — rms
+59 at b47 collapses to a velocity of rms 0.63 through the LayerNorm,
+which is why the tail's norm KIND mattered enough to deserve its
+teeth gate.
+
+Phase 3 state after this entry: every part and the composition are
+conformant at harness T. Remaining for done-means: the same
+composition at production length (E3w blockwise attention, T≈28k,
+where dense scores cannot exist), and the bit-exact scheduler
+driving multi-step denoising with per-step latents gated against the
+reference loop — then time-per-step goes in this notebook.
