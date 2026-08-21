@@ -180,9 +180,9 @@ E1 through E4 have numbers.
    bit-identical to the unrolled form, no speed cost.
 4. ✅ E4 — MIOpen conv lowering, 21–34 TFLOP/s at decoder shapes; VAE
    is not the bottleneck. (Phase 1 entry, 2026-08-21.)
-5. One LTX-2.5 transformer block, numerically conformant against the
-   HuggingFace implementation as oracle — coli-zml's 32/32 teacher-forcing
-   discipline with a new oracle.
+5. ✅ One LTX-2.5 transformer block, numerically conformant against the
+   upstream implementation as oracle — rel-RMS 1.85e-6, RoPE bit-perfect.
+   (Phase 2 entries, 2026-08-21.)
 6. Full DiT: quantized resident weights, static-shape replay across steps.
 7. Block streaming (for f8 or larger variants), tiled VAE, then audio.
 
@@ -942,3 +942,48 @@ torch/numpy versions, seed, and the RoPE metadata. Next session: the
 ZML side — f64 table generation matching the numpy semantics, the
 block graph, and `//ltx:block_conformance` walking the stages in
 order.
+
+## 2026-08-21, night — the block conforms: every gate passes
+
+Four runs from first compile to full pass, and the failure ledger is
+short enough to quote in full: one invalid format string, one tensor
+tag rename, and one genuine specification discovery.
+
+The discovery deserves its ink. Run 2's RoPE gate failed with 223,669
+of 262,144 table bits differing — and the structured straggler records
+turned that wall into a single line: the reference's slot 2 held
+cos(f32(π/2)), not cos(f64 π/2). **The "double-precision" RoPE path
+rounds its frequency grid to f32 before use** — generate_freq_grid_np
+computes linspace and powers in f64 and then returns
+dtype=torch.float32; the f64-ness lives only inside the grid
+computation, and the products and trig run on f32-rounded frequencies
+promoted back to f64. No document says this; the bit patterns do. A
+second, self-inflicted find rode along: probe positions like 20·i/7
+are not f32-representable, so the serialized grid differed from what
+the oracle computed with — production grids are integer pixel
+coordinates, so the probe grid became integer-valued and the
+serialization lossless. Both fixes in, run 3's RoPE gate read
+**0/262,144 straggler bits, worst 0 ulp** — bit-perfect, with the
+coordinate-pinned exception set empty. The gate protocol earned its
+strictness: a looser "close enough" table check would have buried a
+real spec fact under tolerance.
+
+Then the ladder, run 4, in pre-registered order, every stage against
+the f64 oracle with the 2e-3 gate: modulated norm 7.5e-8; q-norm probe
+1.2e-6; gate-bypassed attention 1.5e-6 (projections, full-4096
+weighted RMS, split-half RoPE with per-head bands, sdpa, merge,
+output projection — all correct at once); gated attention 1.4e-6 (the
+2·sigmoid gates); post-SA residual and fresh norm ~9e-7;
+cross-attention with query modulation, prompt-table K/V modulation,
+and gate 1.6e-6; FFN input and output ~1e-6 and 2.1e-6; and the full
+block at **rel-RMS 1.85e-6** — three orders of magnitude inside the
+gate, and ~3000× tighter than the reference's own measured bf16 floor
+of 5.9e-3.
+
+**Milestone 5 is complete.** A ZML-traced graph, compiled by XLA to
+this AMD card, computes LTX-2.5's video transformer block to
+float32 working precision, verified stage-by-stage against the
+upstream implementation running real block-0 weights. Phase 2 closes
+same-day. Phase 3 — all 48 blocks, quantized residency, the distilled
+scheduler — now has a proven template: this block graph, repeated,
+with the E1b-validated int4 path under it.

@@ -45,21 +45,21 @@ bottleneck. Seam plan recorded: the decoder's receptive-field halo
 modest overlap. Cost of entry: a second one-line ZML patch exposing
 the (generic but private) N-D convolution.
 
-## Phase 2 — One conformant transformer block — NEXT
+## Phase 2 — One conformant transformer block — COMPLETE
 
-Build one video-stream block exactly to the checkpoint spec: gated
-self-attention (per-head sigmoid gates) with 3D RoPE (f64-precomputed
-tables baked at trace time), gated cross-attention, bias-free 4× GELU
-FFN, RMS norms, 9-entry AdaLN modulation. Weights come from the real
-checkpoint by range-requesting only block 0's tensors (~600 MB) using
-the offsets already captured in the header — no 42 GB download.
+Closed 2026-08-21, same day it opened (notebook has the full arc).
+The ZML-traced block matches the upstream ltx-core implementation on
+real block-0 weights at **rel-RMS 1.85e-6** (f32 vs f64 oracle;
+~3000× tighter than the reference's own bf16 floor of 5.9e-3), with
+every intermediate stage gated and passing at ~1e-6 and the RoPE
+tables **bit-perfect** (0/262,144 stragglers). One spec discovery en
+route, caught by the bit-level gate: the reference's f64 RoPE path
+rounds its frequency grid to f32 mid-pipeline. Tooling shipped:
+revision-pinned range-request weight fetcher, torch-CPU oracle bundle
+generator with staged dumps verified identical to the reference
+forward, and `//ltx:block_conformance`.
 
-Done means: the block's output matches the reference implementation
-(ltx-core / ComfyUI, CPU) at teacher-forced inputs within an f16-honest
-tolerance, with the comparison methodology written down first — the
-coli-zml 32/32 discipline with a new oracle.
-
-## Phase 3 — Full video-stream DiT
+## Phase 3 — Full video-stream DiT — NEXT
 
 All 48 blocks, int4-resident (~11 GB) via the sub-byte PJRT path,
 static-shape executables replayed across the distilled model's few

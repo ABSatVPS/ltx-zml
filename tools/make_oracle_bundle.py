@@ -56,14 +56,19 @@ def make_grid() -> torch.Tensor:
     """Probe-first indices grid [1, 3, T, 2] (start,end; end=start so the
     middle-grid midpoint is exact). Rows 0-7: only t active (0..max_t
     inclusive, endpoints hit). Rows 8-15: only h. Rows 16-23: only w.
-    Remaining rows: a deterministic mesh over all three axes."""
+    Remaining rows: a deterministic mesh over all three axes.
+    All positions are INTEGER-valued (as production pixel-coordinate grids
+    are), so the f32 serialization of the grid is lossless and the Zig side
+    reconstructs the exact positions the oracle computed with."""
+    t_probe = [0, 3, 6, 9, 12, 15, 17, 20]
+    hw_probe = [0, 292, 585, 877, 1170, 1462, 1755, 2048]
     g = torch.zeros(1, 3, T, dtype=torch.float64)
     for i in range(8):
-        g[0, 0, i] = MAX_POS[0] * i / 7.0
+        g[0, 0, i] = t_probe[i]
     for i in range(8):
-        g[0, 1, 8 + i] = MAX_POS[1] * i / 7.0
+        g[0, 1, 8 + i] = hw_probe[i]
     for i in range(8):
-        g[0, 2, 16 + i] = MAX_POS[2] * i / 7.0
+        g[0, 2, 16 + i] = hw_probe[i]
     k = 0
     for i in range(24, T):
         g[0, 0, i] = (k * 3) % MAX_POS[0]

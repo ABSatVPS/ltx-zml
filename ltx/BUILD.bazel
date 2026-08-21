@@ -20,3 +20,13 @@ zig_binary(
         "//zml",
     ],
 )
+
+# Phase 2: one real transformer block vs the torch/ltx-core oracle bundle.
+zig_binary(
+    name = "block_conformance",
+    main = "block_conformance.zig",
+    visibility = ["//visibility:public"],
+    deps = [
+        "//zml",
+    ],
+)
