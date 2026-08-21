@@ -1,4 +1,4 @@
-# ltx-zml — compiler-generated video generation on AMD (working title)
+# ltx-zml — compiler-generated video generation on AMD
 
 An experiment: adapt the [coli-zml](https://github.com/ABSatVPS/coli-zml)
 approach — no hand-written GPU kernels; Zig traces StableHLO through
