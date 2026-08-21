@@ -861,3 +861,44 @@ Build plan: `tools/fetch_block.py` (range-request block 0 + shared
 tables by header offsets, ~600 MB, checksummed), a torch-CPU
 reference venv that runs the upstream block and dumps input/output
 test vectors, then the ZML block and `//ltx:block_conformance`.
+
+### Phase 2 spec amendments (review adopted before implementation)
+
+Three amendments from review (Adam's local agent, vetted and adopted),
+recorded before any code exists:
+
+**The RoPE cast boundary, made explicit.** All position, frequency,
+angle, sin and cos math in f64 (the numpy path the checkpoint
+selects); one single rounding site — the final cast to f32, exactly
+where the reference's `precompute_freqs_cis` casts to out_dtype. The
+oracle artifact is the SERIALIZED F32 TABLE — the runtime contract —
+not an abstract f64 computation. Gate, stated honestly: f32 bit
+equality for at least 99.99% of entries, stragglers within 1 f32 ulp
+and COUNTED (cross-libm f64 trig can differ in the last f64 ulp, which
+occasionally lands on an f32 rounding boundary; a platform libm
+difference must not become a false blocker, but the count must be
+visible so a real formula error cannot hide inside the allowance).
+Table metadata persists alongside: dims, linspace endpoints, position
+ordering, flattening order, pad placement, rounding site.
+
+**A sparse probe suite before dense comparisons.** Deterministic
+inputs that isolate one thing each: one active axis at a time (t, then
+h, then w, others zero); heads 0, 15, and 31 (the across-heads
+frequency-band split is our most consequential discovery — probe it
+directly); the identity-pad slots, the first, middle, and final
+rotation pairs; fractional positions at both endpoints and both signs.
+A per-head band-allocation bug fails a probe loudly where dense
+rel-RMS would smear it into ambient error.
+
+**Diagnosable mismatches by construction.** Every oracle comparison
+emits max-abs, rel-RMS, NaN/Inf counts, and the argmax-error index
+DECODED into batch/token/head/channel/branch, with reference value,
+ours, and a small neighborhood. The first nonconforming stage should
+localize itself, not open an afternoon of bisection.
+
+Bundle contract for the torch oracle: raw binary tensors plus a JSON
+manifest (shapes, dtypes, hashes, seeds, torch version, spec
+revision) — no format conversions that can silently alter values. The
+fetcher pins the HF revision by commit hash, validates
+non-overlapping expected ranges before writing, and records SHA-256
+plus first/last elements per tensor.
