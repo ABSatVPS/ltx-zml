@@ -175,8 +175,10 @@ E1 through E4 have numbers.
    build: 640 s, 5417 actions, hermetic ROCm userland.)
 2. ✅ E1 and E2 measured, dumps read (runs 1–5, same day — including E1b's
    three-theory detective story; see the run entries).
-3. ⏳ E3 — E2 demanded it, as expected. Now the critical path.
-4. E4.
+3. ✅ E3 — E2 demanded it, as expected. Closed in run 8b: blockwise
+   attention through stablehlo.while runs T=28672 on the 16 GB card,
+   bit-identical to the unrolled form, no speed cost.
+4. ⏳ E4.
 5. One LTX-2.5 transformer block, numerically conformant against the
    HuggingFace implementation as oracle — coli-zml's 32/32 teacher-forcing
    discipline with a new oracle.
@@ -561,3 +563,81 @@ at T ≤ 8192, since the workload is bandwidth-bound and fusion across
 iterations wasn't buying much. If it still OOMs, WCHUNK drops to 512;
 if it's dramatically slower, the host-driven multi-executable loop with
 device-resident stats is the remaining card.
+
+## 2026-08-21, afternoon — run 8 post-mortem: the experiment OOM'd the lab
+
+Run 8 (the first E3w attempt) never reached E3w. The log shows a clean
+build, PJRT load, E1 starting — then an endless "Clearing modules and
+retrying hipModuleLoad" spin: the ROCm runtime could not load kernel
+modules onto a GPU left in a bad state, almost certainly by run 7's
+deliberate back-to-back VRAM exhaustions (E3-unrolled OOM at T=16384,
+then E2-naive marching into its own 17 GiB allocation failure). The
+agent session hosting the run died with it — on a 15 GiB-RAM machine
+also carrying VS Code and, later, an 8-thread LAMMPS simulation, the
+margins are thin. Forensics after the fact: GPU back to ~500 MB used
+and 2% busy once the stuck process was gone — the wedge was process
+state, not hardware. No reboot was needed.
+
+Lessons recorded: first, a smoke that INTENTIONALLY drives the
+allocator into the ground twice per run is hostile to whatever else the
+machine is doing — acceptable while E2/E3 memory limits were the open
+question, but now that both failure points are measured, the naive
+sweep should stop before its known OOM instead of demonstrating it
+every run. Second, git discipline: the run-7 commit was accidentally
+made inside .work/zml (a cwd slip — commands run from wherever the
+previous one left the shell); it was reset out of the ZML checkout and
+re-committed properly in this repo. Absolute paths or explicit `git -C`
+from now on.
+
+Run 8b retries E3w by executing the already-built binary directly —
+no bazel server (a few GB of RAM returned), `nice -n 10`, sharing the
+machine with the LAMMPS run. Benchmark-environment note: run 8b's CPU-
+side timings carry that load; the E3w question (does the while loop's
+bounded live set survive T=16384 and 28672) is load-independent, and
+GPU-side p50s should be only mildly noisy. The run 8 prediction carries
+over unchanged.
+
+## 2026-08-20, evening — run 8b: E3w confirmed on every count
+
+Run 8b (prebuilt binary, no bazel server, nice 10, sharing the machine
+with the chimera-autoresearch LAMMPS loop — which, it turns out, was
+the mystery load, cycling a new simulation every ~25 minutes) delivered
+the E3w verdict:
+
+Correctness: while-vs-unrolled rms at T=1024 is **0.00000** — bit-
+identical, same algorithm, same chunk order. The verification chain now
+runs CPU f64 oracle → zml.nn.sdpa → unrolled blockwise → while
+blockwise with no gaps.
+
+Speed: the feared cost of losing cross-iteration fusion did not
+materialize — 48.6 vs 47.9 ms at T=4096, and at T=8192 the while form
+was marginally FASTER (125.9 vs 128.2 ms). Bandwidth-bound workloads
+don't miss fusion across iterations.
+
+Memory, the actual question: **T=16384 ran (449 ms, 9.8 TFLOP/s) and
+T=28672 ran (1222 ms, 11.0 TFLOP/s)** — full LTX-2.5 working sequence
+length, on the 16 GB card, through a compiler-traced stablehlo.while,
+with throughput CLIMBING as T grows (better amortization of the loop
+state updates). The unrolled form OOM'd at 16384 again in the same run,
+completing the controlled comparison: the while loop's loop-carried
+buffer reuse is what makes video-length attention fit, exactly as
+pre-registered.
+
+Honest engine arithmetic: 1.22 s per 48-layer step's worth of one
+self-attention, times 48 layers ≈ 59 s of attention per denoising step
+at current efficiency — minutes per clip on the distilled model before
+optimization. Known headroom, in order: f16 scores (~2× — today the
+chunk scores round-trip VRAM in f32), Q-tiling, and head-batching the
+two GEMMs per chunk harder. Also noted: run 8b's numbers were ~15%
+BETTER than run 7's despite the LAMMPS load — run-to-run variance on
+this card is real; comparisons should stay within-run.
+
+Hygiene applied: the naive E2 sweep now stops before its known OOM
+(the smoke no longer wedges the GPU by design), verified with
+`zig ast-check` after the stale-diagnostic scare.
+
+**E3 is closed.** Attention was the make-or-break for the whole
+project (genesis entry, "this project's dot_general moment") — it
+broke the right way, twice over: hipBLASLt matrix cores for the GEMMs,
+stablehlo.while for the memory bound. Next: E4 (VAE conv tiles), then
+the first real transformer block against the HF oracle.

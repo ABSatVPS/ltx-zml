@@ -573,6 +573,14 @@ pub fn main(init: std.process.Init) !void {
         H, HD, @as(f64, @floatFromInt(28672 * 28672 * 2)) / 1e9,
     });
     for (T_LIST) |t| {
+        // Known result from runs 3/7: the f32 scores materialization OOMs
+        // the 16 GB card at T=16384 (H=32). Demonstrating it every run left
+        // the GPU wedged once (run 8's hipModuleLoad loop) — the naive
+        // sweep now stops short; E3w above covers the larger sizes.
+        if (@as(u64, @intCast(H * t * t)) * 4 > 12_000_000_000) {
+            log.info("  T={d}: skipped — known f32-scores OOM (runs 3/7); E3w covers this size", .{t});
+            break;
+        }
         const tu: usize = @intCast(t);
         const n = Hu * tu * HDu;
         const q = try allocator.alloc(f16, n);
@@ -587,7 +595,7 @@ pub fn main(init: std.process.Init) !void {
 
         const q_shape: zml.Shape = .init(.{ .h = H, .q = t, .hd = HD }, .f16);
         const kv_shape: zml.Shape = .init(.{ .h = H, .k = t, .hd = HD }, .f16);
-        log.info("  T={d}: uploading + compiling (a crash past this line means XLA materialized ~{d:.1} GB of scores)", .{
+        log.info("  T={d}: uploading + compiling (~{d:.1} GB of f16 scores if materialized)", .{
             t, @as(f64, @floatFromInt(Hu * tu * tu * 2)) / 1e9,
         });
         var q_buf = try uploadF16(io, platform, q_shape, q);

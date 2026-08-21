@@ -7,18 +7,23 @@ reaches the GPU — from sparse MoE LLM decode to dense video diffusion.
 Target model: LTX-2.5. Hardware: Radeon RX 9060 XT (Navi 44, gfx1200,
 RDNA 4), 16 GB VRAM, Fedora 44.
 
-**Status: feasibility smoke complete (day one).** Measured on the target
-card: XLA routes large f16 GEMMs to hipBLASLt and reaches ~59 TFLOP/s on
-gfx1200 (matrix cores engaged; autotuning is worth 3×); int4-resident
-weights with in-graph dequant feed those GEMMs at full dense speed, so
-quantized residency costs nothing at prefill sizes; naive attention
-materializes f32 scores and OOMs at T=16384 on 16 GB, making in-graph
-blockwise attention (E3) the critical path; and naive device-to-host
-readback runs at ~0.5 GB/s, so everything stays on device until the final
-frames. The journal at [docs/lab-notebook.md](docs/lab-notebook.md) is the
-source of truth — it logs the why behind each decision, with hypotheses
-written down before the measurements, including the three that died on
-day one.
+**Status: attention feasibility proven (E1–E3 complete).** Measured on
+the target card: XLA routes large f16 GEMMs to hipBLASLt and reaches
+~59 TFLOP/s on gfx1200 (matrix cores engaged; autotuning is worth 3×);
+int4-resident weights with in-graph dequant feed those GEMMs at full
+dense speed, so quantized residency costs nothing at prefill sizes; and
+**blockwise online-softmax attention traced through `stablehlo.while`
+runs the full 28k-token LTX working length on 16 GB** — bit-identical to
+its unrolled twin, beating naive sdpa where naive fits at all (naive
+materializes f32 scores and dies at a quarter of video length). Also
+learned the hard way: naive device-to-host readback runs at ~0.5 GB/s,
+so everything stays on device until the final frames. Attention geometry
+is verified against LTX-2.5's own code (32 heads × 128, 48 layers). Next:
+E4 (VAE conv tiles), then a real transformer block against the HF
+oracle. The journal at [docs/lab-notebook.md](docs/lab-notebook.md) is
+the source of truth — it logs the why behind each decision, with
+hypotheses written down before the measurements, including the ones
+that died.
 
 ## Layout
 
