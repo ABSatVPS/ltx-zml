@@ -86,6 +86,9 @@ def main() -> int:
     ap.add_argument("--file", default=DEFAULT_FILE)
     ap.add_argument("--revision", default=PINNED_REVISION,
                     help="commit sha to fetch from ('main' re-resolves via the API)")
+    ap.add_argument("--extras", action="store_true",
+                    help="fetch the NON-transformer-block video-side tensors "
+                         "(adaln, prompt adaln, patchify/proj, connector, ...) instead of a block")
     args = ap.parse_args()
     out = pathlib.Path(args.outdir)
     out.mkdir(parents=True, exist_ok=True)
@@ -104,16 +107,25 @@ def main() -> int:
     data_base = 8 + hlen
     print(f"header: {hlen} bytes, {len(hdr)} tensors")
 
-    prefix = f"model.diffusion_model.transformer_blocks.{args.block}."
     selected = {}
-    for name, entry in hdr.items():
-        if not name.startswith(prefix):
-            continue
-        rest = name[len(prefix):]
-        if any(m in rest for m in AUDIO_MARKERS):
-            continue
-        if rest.startswith(VIDEO_KEYS):
+    if args.extras:
+        base = "model.diffusion_model."
+        for name, entry in hdr.items():
+            if not name.startswith(base) or ".transformer_blocks." in name:
+                continue
+            if any(m in name[len(base):] for m in AUDIO_MARKERS):
+                continue
             selected[name] = entry
+    else:
+        prefix = f"model.diffusion_model.transformer_blocks.{args.block}."
+        for name, entry in hdr.items():
+            if not name.startswith(prefix):
+                continue
+            rest = name[len(prefix):]
+            if any(m in rest for m in AUDIO_MARKERS):
+                continue
+            if rest.startswith(VIDEO_KEYS):
+                selected[name] = entry
     if not selected:
         print("nothing selected — wrong block index or prefix?", file=sys.stderr)
         return 1

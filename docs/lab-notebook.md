@@ -2008,3 +2008,35 @@ now-gated parts plus the named remainder: the non-block tensors
 (patchify/adaln/final projections, 4.89 GB, mapped in the audit), the
 scheduler loop driving 48-block passes at production T, and the E3w
 kernel doing its production job at that length.
+
+## 2026-08-21, late night — non-block inventory, and a CPU false alarm
+
+Adam flagged CPU spikes; checked before proceeding. Verdict: not the
+experiment — every pipeline process is drained. The culprits are a
+transient Flatpak update transaction (revokefs-fuse pair) and
+warp-taskbar sitting at a steady 36% CPU for sixteen hours (5h45m
+cumulative) — a busy-loop bug in the terminal app, cleared by
+restarting Warp, Adam's call. Logged because "the machine is busy"
+must never be conflated with "the experiment is busy."
+
+Then the non-block tensor map, from the pinned header, and it splits
+better than the audit's single 4.89 GB number suggested. The
+VIDEO-ONLY denoising pass needs just ~450 MB: adaln_single (302 MB —
+the sinusoidal-embed → MLP → 4096→36864 linear that PRODUCES the
+9-chunk per-token timestep tensor our blocks have consumed as a
+frozen input all along), prompt_adaln_single (103 MB — producing our
+pts2), patchify_proj (128→4096 in), proj_out (4096→128 out), the
+final scale_shift_table [2,4096], and the keyframes embedding. The
+other ~3.4 GB is the video_embeddings_connector — the 8-block,
+128-register prompt transformer, which is Phase 4's once-per-prompt
+path — plus the A/V-bridge adaln (170 MB, Phase 7). Audio-side
+non-block tensors (1.05 GB) stay excluded.
+
+Fetched ALL of the video side now (153 tensors, 3.84 GB, same pinned
+revision, fetch_block.py --extras) so no later phase has a fetch
+step hiding in it. Next build, pre-registration to come in its own
+entry: the E2E-core parts get small oracles of their own (they are
+plain linears and norms — cheap to gate the Phase 2 way), then the
+composition: patchify → adaln-driven 48-block streamed passes under
+the bit-exact scheduler → proj_out, first at harness T, then at
+production length where E3w does its real job.
