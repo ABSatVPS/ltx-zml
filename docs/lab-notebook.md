@@ -2242,3 +2242,46 @@ composition at production length (E3w blockwise attention, T≈28k,
 where dense scores cannot exist), and the bit-exact scheduler
 driving multi-step denoising with per-step latents gated against the
 reference loop — then time-per-step goes in this notebook.
+
+## 2026-08-21, afternoon — pre-registration: the scheduler-driven multi-step loop at harness T
+
+The other half of Phase 3's done-means: "latents match the reference
+step-by-step." The build: tools/make_e2e_denoise_bundle.py runs the
+REFERENCE stage-1 loop (euler_denoising_loop / EulerDiffusionStep /
+GaussianNoiser / timesteps_from_mask / post_process_latent, imported
+through the same package shim as the scheduler bundle) with the REAL
+f64 model as denoise_fn — patchify → adaln → 48 blocks → tail →
+to_denoised — at T=64, 8 steps over the full distilled stage-1 sigma
+ladder. Audio marches with zero velocities (video-only scope, audio
+values never touch the video state). The scheduler bundle's mask
+convention is reused deliberately: ones, tokens 48:56 at 0.0, 56:64
+at 0.5 — the 0.5 region makes THREE distinct per-token sigmas per
+step, so nothing in the engine can get away with special-casing the
+binary mask. Per-step dumps: t vector, velocity, denoised, post,
+next latent.
+
+New ground this rung covers, called out before measuring: (a) pts2 is
+sigma-driven, so it CHANGES every step — the single-forward harness
+ran it once at a fixed sigma; (b) the ring makes 384 acquisitions
+(48 blocks x 8 steps) through a repeating schedule, its first
+non-identity schedule since the dry run; (c) the host scheduler
+(bit-exact 94/94) and the device engine compose for the first time —
+latent marches host-side through lerp/toDenoised/postProcess/
+eulerStep, velocities come from the card.
+
+Scope: STAGE 1 ONLY. Stage 2's scheduler mechanics are already
+bit-exact in scheduler_conformance and its model side is identical;
+a second 2-hour f64 oracle run buys no new information.
+
+H-LOOP-1: each step's velocity conforms at ≤2e-3, expected ~1e-4
+(the single-pass composition measured 8.4e-5; conditioning changes
+per step but stays in the same regime). H-LOOP-2: the latent
+trajectory compounds velocity error; expected final-latent rel-RMS
+1e-4..1e-3 against a 2e-3 budget — if compounding is worse than
+linear in steps, that is a finding, not a fence failure, unless the
+budget breaks. CONTROL (bitwise): the engine recomputes the noised
+initial latent from the dumped clean/noise/mask through
+ltx/scheduler.zig's lerp chain and it must equal the oracle's
+s1_x0 EXACTLY — the fused-lerp discovery standing guard at the
+integration seam. Oracle-side control: the noise twin-capture
+assert, as in the scheduler bundle.
