@@ -7,7 +7,7 @@ reaches the GPU — from sparse MoE LLM decode to dense video diffusion.
 Target model: LTX-2.5. Hardware: Radeon RX 9060 XT (Navi 44, gfx1200,
 RDNA 4), 16 GB VRAM, Fedora 44.
 
-**Status: attention feasibility proven (E1–E3 complete).** Measured on
+**Status: all feasibility experiments answered (E1–E4 complete).** Measured on
 the target card: XLA routes large f16 GEMMs to hipBLASLt and reaches
 ~59 TFLOP/s on gfx1200 (matrix cores engaged; autotuning is worth 3×);
 int4-resident weights with in-graph dequant feed those GEMMs at full

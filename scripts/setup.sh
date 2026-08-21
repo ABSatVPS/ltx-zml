@@ -37,6 +37,11 @@ git -C "$WORK/zml" apply --reverse --check "$REPO/patches/zml-pjrt-subbyte-trans
     && echo "    already applied" \
     || git -C "$WORK/zml" apply "$REPO/patches/zml-pjrt-subbyte-transfer.patch"
 
+say "patching ZML: expose the generic N-D convolution (conv3d for the VAE)"
+git -C "$WORK/zml" apply --reverse --check "$REPO/patches/zml-pub-convolution.patch" 2>/dev/null \
+    && echo "    already applied" \
+    || git -C "$WORK/zml" apply "$REPO/patches/zml-pub-convolution.patch"
+
 say "refreshing ROCm package checksums (AMD republishes .debs in place)"
 python3 "$REPO/tools/fix_rocm_lockfile.py" "$WORK/zml/platforms/rocm/packages.lock.json"
 

@@ -33,20 +33,19 @@ fusion-fed GEMM gap at S=28,672 (suspected autotuner algorithm choice);
 f16 scores in the attention loop (~2× expected); a pinned-memory
 readback path for final frames (naive readback measured at ~0.5 GB/s).
 
-## Phase 1 — E4: VAE conv tiles — NEXT
+## Phase 1 — E4: VAE conv tiles — COMPLETE
 
-Question: what does XLA's convolution path on ROCm deliver on
-VAE-decode-shaped 3D convolutions, and what tile geometry keeps decode
-inside the VRAM budget next to resident DiT weights? LTX-2.5 ships two
-video VAEs (DiffVAE, heavier; Conv VAE, lighter) — probe the Conv VAE
-shapes first.
+Answered 2026-08-21 (notebook has the numbers): XLA routes 3D convs to
+MIOpen (`__cudnn$convForward`), delivering 21–34 TFLOP/s f16 at the
+decoder's checkpoint-exact shapes. Decode arithmetic: ~1.4 s per
+8×16×16 latent tile, ~35–60 s per 10 s clip — comparable to one
+denoising step's attention, so the VAE is a co-star, not the
+bottleneck. Seam plan recorded: the decoder's receptive-field halo
+(~15 latent voxels) makes exact tiling untenable; Phase 5 blends with
+modest overlap. Cost of entry: a second one-line ZML patch exposing
+the (generic but private) N-D convolution.
 
-Done means: measured GB/s and ms per tile at two or three candidate
-tile geometries, a chosen geometry with the arithmetic for why, and a
-seam-overlap plan for the causal convs written down before any decoder
-is built.
-
-## Phase 2 — One conformant transformer block
+## Phase 2 — One conformant transformer block — NEXT
 
 Build one video-stream block exactly to the checkpoint spec: gated
 self-attention (per-head sigmoid gates) with 3D RoPE (f64-precomputed

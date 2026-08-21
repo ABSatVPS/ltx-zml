@@ -178,7 +178,8 @@ E1 through E4 have numbers.
 3. ✅ E3 — E2 demanded it, as expected. Closed in run 8b: blockwise
    attention through stablehlo.while runs T=28672 on the 16 GB card,
    bit-identical to the unrolled form, no speed cost.
-4. ⏳ E4.
+4. ✅ E4 — MIOpen conv lowering, 21–34 TFLOP/s at decoder shapes; VAE
+   is not the bottleneck. (Phase 1 entry, 2026-08-21.)
 5. One LTX-2.5 transformer block, numerically conformant against the
    HuggingFace implementation as oracle — coli-zml's 32/32 teacher-forcing
    discipline with a new oracle.
@@ -752,3 +753,48 @@ is a real trade at tile 16×16) is deliberately deferred to Phase 5
 design, as the roadmap says. ZML needs no patch for any of this: its
 `convolution` is generically N-dimensional; conv1d/conv2d are wrappers,
 and a third spatial dimension is just longer arrays.
+
+## 2026-08-21, continued — E4 answered: MIOpen delivers, and Phase 1 closes
+
+First result, before any number: the hypothesis entry's "ZML needs no
+patch for any of this" died within the hour. `convolution` IS
+generically N-dimensional — and private. conv1d/conv2d are its only
+public doors. The project's second one-line ZML patch
+(`zml-pub-convolution.patch`) exposes it; setup.sh applies it.
+
+Then the run (oracle first: conv3d vs CPU f64 at rms 0.00021 — the
+dimension-number wiring is right). Hypothesis 1 confirmed: every conv
+lowers to the `__cudnn$convForward` custom call, which on ROCm is
+MIOpen — the conv twin of E1a's cublas→hipBLASLt discovery. The
+compiler stack's fast path, again, is "hand the op to the vendor
+library," with zero hand-written kernels in this repo.
+
+Hypothesis 2 confirmed, with compute-isolated numbers (scalar-sum
+twins, the lesson runs 4/5 taught): stageA 1024ch at 26.9 TFLOP/s, the
+1024→4096 upsample conv at 33.9, stageC 512ch at 30.9, stageE 128ch at
+20.7 — the predicted narrow-channel dip is real but mild. The
+full-output runs are a third independent confirmation of the readback
+constant (~0.7 GB/s: 374 ms for stageE's 268 MB).
+
+Hypothesis 3 survives with a corrected magnitude. Real arithmetic per
+8×16×16 latent tile: stage C's eight 512-channel convs at 60 ms each
+dominate (~480 ms), stages D and E add ~360 ms each, the top and the
+upsamples ~120 ms — call it ~1.4 s per tile. A 10 s 1216×704 clip is
+~24 tiles before overlap: **roughly 35–60 s of decode per clip.** Not
+the "seconds" the hypothesis hoped, but the conclusion holds — that is
+comparable to ONE denoising step's attention, so across 4–8 distilled
+steps the VAE is a co-star, not the bottleneck.
+
+And the seam plan, written down as Phase 1's acceptance demanded: the
+decoder's receptive field, summed across ~44 3×3×3 convs at their
+respective scales, is ~15 latent voxels of halo per side — as large as
+the tile itself. Exact-overlap tiling is therefore untenable; Phase 5
+decodes with modest overlap (~4 latent voxels) and feathered blending
+in pixel space, accepting approximation at seams, with correctness
+judged by rms in overlap regions and eyes on the output — the same
+trade every production tiled decoder makes, now with the arithmetic
+that forces it recorded.
+
+**Phase 1 complete.** E1 through E4 are all answered. Next: Phase 2 —
+one checkpoint-exact transformer block against the reference, using
+range-requested block-0 weights.

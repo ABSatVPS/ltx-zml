@@ -48,6 +48,17 @@ fn conv3dGraph(x: zml.Tensor, w: zml.Tensor) zml.Tensor {
     });
 }
 
+/// Compute-isolated twin: same conv, f32 scalar-sum epilogue, 4-byte
+/// download — the lesson runs 4/5 taught about readback-polluted timings.
+fn conv3dSumGraph(x: zml.Tensor, w: zml.Tensor) zml.Tensor {
+    return conv3dGraph(x, w).convert(.f32)
+        .sum(.b).squeeze(.b)
+        .sum(.c).squeeze(.c)
+        .sum(.t).squeeze(.t)
+        .sum(.h).squeeze(.h)
+        .sum(.w).squeeze(.w);
+}
+
 const Case = struct {
     name: []const u8,
     cin: i64,
@@ -172,6 +183,37 @@ pub fn main(init: std.process.Init) !void {
             log.err("  {s}: COMPILE failed ({s})", .{ c.name, @errorName(err) });
             continue;
         };
+        var sum_exe = platform.compileFn(allocator, io, conv3dSumGraph, .{ x_spec, w_spec }, .{}) catch |err| {
+            log.err("  {s}: sum-epilogue COMPILE failed ({s})", .{ c.name, @errorName(err) });
+            continue;
+        };
+
+        // Compute-isolated timing first (4-byte download).
+        const flop = 2.0 * @as(f64, @floatFromInt(c.cin * c.cout * 27 * c.t * c.h * c.w));
+        {
+            const reps_s = 6;
+            var ts_: [reps_s]u64 = undefined;
+            for (0..reps_s + 1) |r| {
+                const t0 = nowNs(io);
+                var args = try sum_exe.args(allocator);
+                defer args.deinit(allocator);
+                var results = try sum_exe.results(allocator);
+                defer results.deinit(allocator);
+                args.set(.{ x_buf, w_buf });
+                sum_exe.call(args, &results);
+                var o: zml.Buffer = results.get(zml.Buffer);
+                defer o.deinit();
+                var s = try o.toSliceAlloc(allocator, io);
+                s.free(allocator);
+                if (r > 0) ts_[r - 1] = @intCast(nowNs(io) - t0);
+            }
+            std.mem.sort(u64, &ts_, {}, std.sort.asc(u64));
+            log.info("  {s} @ {d}x{d}x{d} COMPUTE: p50 {d:.2}ms -> {d:.2} TFLOP/s", .{
+                c.name, c.t, c.h, c.w,
+                ms(ts_[reps_s / 2]),
+                flop / 1e12 / (ms(ts_[reps_s / 2]) / 1e3),
+            });
+        }
 
         const n_out: usize = @intCast(c.cout * c.t * c.h * c.w);
         const out = try allocator.alloc(f16, n_out);
@@ -205,14 +247,11 @@ pub fn main(init: std.process.Init) !void {
         if (!ok) continue;
         std.mem.sort(u64, &times, {}, std.sort.asc(u64));
         const p50 = times[reps / 2];
-        const flop = 2.0 * @as(f64, @floatFromInt(c.cin * c.cout * 27 * c.t * c.h * c.w));
         const out_mb = @as(f64, @floatFromInt(n_out * 2)) / 1e6;
-        const dl_ms = out_mb / 500.0 * 1000.0; // known ~0.5 GB/s readback estimate
-        log.info("  {s} @ {d}x{d}x{d}: p50 {d:.2}ms incl. ~{d:.0}ms est. readback of {d:.0} MB -> >= {d:.2} TFLOP/s", .{
+        log.info("  {s} @ {d}x{d}x{d} FULL (incl. {d:.0} MB readback): p50 {d:.2}ms -> {d:.2} TFLOP/s apparent", .{
             c.name, c.t, c.h, c.w,
-            ms(p50),
-            dl_ms,
             out_mb,
+            ms(p50),
             flop / 1e12 / (ms(p50) / 1e3),
         });
     }
