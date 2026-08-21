@@ -23,7 +23,8 @@ E4 (VAE conv tiles), then a real transformer block against the HF
 oracle. The journal at [docs/lab-notebook.md](docs/lab-notebook.md) is
 the source of truth — it logs the why behind each decision, with
 hypotheses written down before the measurements, including the ones
-that died.
+that died. [ROADMAP.md](ROADMAP.md) tracks the phases ahead and what
+"done" means for each.
 
 ## Layout
 
