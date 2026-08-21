@@ -641,3 +641,14 @@ project (genesis entry, "this project's dot_general moment") — it
 broke the right way, twice over: hipBLASLt matrix cores for the GEMMs,
 stablehlo.while for the memory bound. Next: E4 (VAE conv tiles), then
 the first real transformer block against the HF oracle.
+
+Addendum, run 8b close-out: the run finished end to end — the first
+complete SMOKE COMPLETE with every experiment in one pass, exit 0, GPU
+left healthy. One observation worth keeping: the naive T=16384 failure
+surfaced at COMPILE time as error "Internal" this run, not at execute
+as ResourceExhausted — the autotuner allocates real buffers while
+compiling, so where the OOM manifests moves around. Reason enough that
+the catch wraps compile and execute both, and that the cap (committed)
+avoids the attempt entirely. The stack traces after SMOKE COMPLETE are
+the debug allocator reporting the deliberately never-freed platform and
+executables — cosmetic.
