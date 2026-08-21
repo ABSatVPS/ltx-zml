@@ -2154,3 +2154,49 @@ H-CORE-5, the composition target for the NEXT entry once these pass:
 patchify → adaln-driven 48 streamed blocks → tail at harness T=64
 against a full-forward f64 oracle, budget 2e-3 with expectation
 ~1.5e-5 carried from the stage-walk.
+
+### E2E-core results: all gates pass; the sinusoid's stragglers are argument-ulps
+
+Built tools/make_core_bundle.py (f64 reference through the REAL code
+paths — TransformerArgsPreprocessor._prepare_timestep for the x1000
+flatten/reshape, LTXModel._process_output called unbound for the tail,
+since self is unused there — staging asserted against the helper at
+1e-12), ltx/core_parts.zig (17 tensors, sinusoid in-graph from
+arange/exp/sin/cos), and //ltx:core_conformance. Eight gates, one run,
+all PASS:
+
+sinu 5.720e-6 rel-RMS (max-abs 5.302e-5) · emb 7.846e-7 · ts9
+8.671e-7 · pts2 1.289e-6 · patchify 2.029e-7 · tail 3.073e-7 ·
+tailWrong-vs-oracle-control 3.006e-7 · tailWrong-vs-truth 3.912e-3
+(must exceed 1e-3: teeth PASS).
+
+H-CORE-1/3/4 land where pre-registered (~1e-6). H-CORE-2's "~1e-7"
+was optimistic and the miss is worth its arithmetic: the sinusoid's
+frequency vector is exp() of a small table, and one f32 ulp of a
+frequency near 1.0 (~6e-8) multiplied by the largest argument
+(0.909375 x 1000 = 909.375) is ~5.5e-5 of phase — sin then moves by
+up to that much. Measured max-abs-diff: 5.302e-5. The stragglers are
+argument-ulp amplification, not a sloppy transcendental: every one
+sits within ONE ulp-of-the-argument bound, and the multiply path
+itself (x1000 in f32 vs the oracle's f64-then-round) is provably
+identical because t_f32 x 1000 fits f64 exactly. The next gate is the
+proof no fallback is needed: embedded_timestep, one MLP downstream of
+those stragglers, conforms at 7.8e-7 — the GEMM averages 256 O(1)
+inputs and the few amplified entries vanish into it. The
+freq-table-as-data fallback (RoPE-style contract) stays unfiled.
+
+Two smaller receipts. The wrong-norm control pair: engine RMS-tail
+matches the ORACLE's RMS-tail dump at 3.0e-7 while both differ from
+the true LayerNorm tail by 3.9e-3 — engine and oracle agree on the
+exact SIZE of the wrongness, which is the strongest form of gate
+teeth. The 3.9e-3 is modest because seeded random x is near
+zero-mean (LayerNorm ~ RMSNorm there); real block-47 output may
+separate them harder, and the composition gate will see that for
+free. And the conditioning tokens (t=0) cost nothing: their sinusoid
+is exactly [1]x128,[0]x128 on both sides.
+
+Every non-block part of the video-only pass is now individually
+conformant. Next rung, H-CORE-5 as pre-registered: the composition —
+patchify -> adaln-driven 48 streamed blocks -> tail at harness T=64
+against a full-forward f64 oracle (extending the walk bundle), budget
+2e-3, expectation ~1.5e-5 carried from the stage-walk.

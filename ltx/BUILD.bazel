@@ -67,6 +67,21 @@ zig_binary(
     ],
 )
 
+# E2E-core parts (adaln singles, patchify, output tail) vs the torch
+# f64 core bundle — the non-block remainder of the video-only pass.
+zig_binary(
+    name = "core_conformance",
+    main = "core_conformance.zig",
+    srcs = [
+        "block.zig",
+        "core_parts.zig",
+    ],
+    visibility = ["//visibility:public"],
+    deps = [
+        "//zml",
+    ],
+)
+
 # E-STREAM-3: the streaming ring's three-block dry run (0/23/47).
 zig_binary(
     name = "ring_dryrun",
