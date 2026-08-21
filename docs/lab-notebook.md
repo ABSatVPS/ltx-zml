@@ -2040,3 +2040,117 @@ plain linears and norms — cheap to gate the Phase 2 way), then the
 composition: patchify → adaln-driven 48-block streamed passes under
 the bit-exact scheduler → proj_out, first at harness T, then at
 production length where E3w does its real job.
+
+## 2026-08-21, late morning — the extras claim regressed, then came true
+
+Correction to the record: the previous entry's "fetched ALL of the
+video side now" was written while the fetch was still running, and it
+then briefly became false. Warp (the terminal app whose busy-loop we
+had just diagnosed) crashed and took the whole desktop session with
+it, killing the detached fetch at 62/153 tensors. Adam fixed Warp;
+the fetch was relaunched and this time COMPLETED: 153/153 tensors,
+3.84 GB in .work/extras, manifest.json written, pinned revision
+6c7e5e57 throughout. Verified directly from the manifest, not the
+monitor — because the monitor never fired: its pgrep pattern matched
+its own shell's command line, so it saw the "process" alive forever.
+Same self-match footgun as the pkill incident, opposite polarity.
+Watchers must match the watched process, never their own reflection.
+
+One checkpoint observation from the completed manifest, recorded
+before anyone needs it: scale_shift_table is the single f32 tensor on
+the checkpoint's video side — everything else, weights and biases
+alike, ships bf16. The final modulation table was deemed too
+precision-sensitive to round. Noted for the loader (dtype is per-entry
+anyway) and for anyone tempted to assume "the checkpoint is bf16."
+
+## 2026-08-21, late morning — E2E-core read: what the reference actually does between latent and latent
+
+Read receipts before pre-registering the oracles, from
+ltx_core/model/transformer/{adaln.py, timestep_embedding.py,
+model.py, transformer_args.py} at the installed reference versions,
+because "plain linears and norms" is exactly the kind of claim this
+notebook exists to check. Mostly confirmed, with four facts worth
+their own lines.
+
+The input side (TransformerArgsPreprocessor.prepare, video-only
+path): x = patchify_proj(latent) — a plain biased Linear 128→4096.
+Then the keyframes absolute-position embedding is applied ONLY when a
+keyframes_mask is present; our harness passes none, so it is a
+structural no-op (and the checkpoint tensor is there for when Phase
+7+ wants it). There is NO caption_projection in this checkpoint — the
+24 non-connector video tensors are fully accounted for without one,
+so prompt context arrives already at model width from the connector.
+
+The timestep path: timestep × timestep_scale_multiplier (1000 for
+this model, config default, same as PixArt lineage), flattened —
+per-token conditioning rides through here, [B,T] becoming B·T
+independent sinusoidal embeddings. The sinusoidal is the DDPM/PixArt
+256-dim embedding with flip_sin_to_cos=True (cos half first),
+downscale_freq_shift=0 (exponent divisor is half_dim, 128, not 127).
+FACT ONE: get_timestep_embedding computes in f32 unconditionally —
+torch.arange(dtype=f32), .float() on the timesteps — and only THEN
+casts to hidden_dtype. Even an f64 oracle carries f32-rounded
+sinusoids. This is the RoPE mid-pipeline f32 rounding discovery
+wearing a different hat, and this time we saw it coming by reading
+first. The MLP after it: linear_1 256→4096, SiLU, linear_2
+4096→4096 = embedded_timestep; then adaln's OWN SiLU and the big
+linear 4096→36864 = the 9-chunk per-token ts our blocks consume
+(9 = 6 base + 3 cross-attn params, matching adaln.py's constants).
+FACT TWO: prompt_adaln_single (embedding_coefficient=2 → 8192 = our
+pts2) is driven by modality.sigma — the SCALAR sigma, not the
+per-token timesteps — through the SAME ×1000 multiplier and the same
+_prepare_timestep helper. The prompt-side modulation never sees the
+denoise mask.
+
+The output side (_process_output): scale_shift_values =
+scale_shift_table[None,None] + embedded_timestep[:,:,None] — the
+[2,4096] f32 table broadcast against the 4096-dim embedded_timestep,
+giving per-token shift (index 0) and scale (index 1). FACT THREE:
+norm_out is torch.nn.LayerNorm(4096, elementwise_affine=False,
+eps=1e-6) — a TRUE mean-subtracting LayerNorm, not the RMSNorm the
+blocks use everywhere. An engine that reaches for the existing rmsNoW
+helper out of habit would be wrong in a way the gates must catch.
+Then x·(1+scale)+shift, then proj_out 4096→128, biased. FACT FOUR:
+embedded_timestep enters this tail RAW — the adaln's SiLU sits only
+in front of the 36864 linear, not on the embedded_timestep the tail
+consumes. The same [B,T,4096] tensor conditions both ends of the
+model, un-activated.
+
+Config values pinned from model_configurator defaults (this
+checkpoint's config overrides none of them): norm_eps 1e-6,
+timestep_scale_multiplier 1000. The av_ca adaln singles feed only the
+A/V bridge (MultiModalTransformerArgsPreprocessor) — skipped in our
+video-only Phase 3 scope exactly as the roadmap's audio-stub note
+says.
+
+### Pre-registration: E2E-core oracles (the Phase 2 treatment, smaller)
+
+The build: tools/make_core_bundle.py runs the reference modules in
+f64 (weights upcast from the extras bf16 bins; sinusoid f32 by the
+reference's own construction) on seeded inputs — latent [1,64,128], a
+per-token timestep vector built as denoise_mask·σ with a mixed mask
+and σ=0.909375 from the distilled table, scalar sigma for the prompt
+side — and dumps staged outputs: sinusoid, embedded_timestep, ts
+9-chunk, pts2, patchify out, and the output tail applied to a seeded
+x. Engine side: ltx/core_parts.zig (sinusoid built in-graph from
+iota/exp/sin/cos, the two MLPs, patchify, LayerNorm tail) gated per
+stage in ltx/core_conformance.zig.
+
+H-CORE-1: patchify_proj and proj_out (plain biased GEMMs) conform at
+~1e-6 rel-RMS, the Phase 2 per-stage level. H-CORE-2: the sinusoid
+gate is the interesting one — both sides compute f32, but XLA's
+sin/cos and libm's need not round identically; per the transcendental
+budget precedent (RoPE straggler protocol) I expect agreement at
+~1e-7 rel-RMS with possible few-ulp stragglers, and pre-commit to the
+ulp protocol rather than loosening the budget if a handful appear.
+Arguments are bounded by ×1000 scaling times max σ=1.0, so no
+range-reduction cliff. H-CORE-3: embedded_timestep and the ts 9-chunk
+conform at ~1e-6 (two GEMMs deep, one shared executable, so no
+cross-exe autotune tax within a gate). H-CORE-4: the output tail
+conforms at ~1e-6, and specifically a deliberate wrong-norm control
+(RMSNorm in place of LayerNorm) must FAIL the gate by orders of
+magnitude — if it doesn't, the gate has no teeth for fact three.
+H-CORE-5, the composition target for the NEXT entry once these pass:
+patchify → adaln-driven 48 streamed blocks → tail at harness T=64
+against a full-forward f64 oracle, budget 2e-3 with expectation
+~1.5e-5 carried from the stage-walk.
