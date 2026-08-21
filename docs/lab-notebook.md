@@ -1686,3 +1686,142 @@ E-STREAM-1 and -2 are answered. Remaining before assembly:
 E-STREAM-3 — the ring itself (three device slots, two pinned host
 slots, mmap reader, lifecycle asserts, startup static-cycle check)
 plus the one-blob-per-block pack step in tooling.
+
+## 2026-08-21/22, overnight — E-STREAM-3 pre-registered: the acceptance contract for the first engine component
+
+Adam's agent reviewed the E-STREAM results and proposed an acceptance
+contract for the ring. Most of it is adopted verbatim — lifecycle
+states asserted on every transition, the static schedule check before
+any allocation, the packer as an offline reproducible transformation
+with canonical ordering and digests, and the staged three-block dry
+run before any 48-block ambition. Four corrections before adoption,
+logged per house rules:
+
+One: the dry run uses blocks 0, 23, and 47 — the blocks actually
+fetched, quantized (block 0), and oracle-anchored by the chain bundle
+— not "blocks 0, 1, 2". Two: the packer's input is the revision-pinned
+per-block directories from tools/fetch_block.py (range requests
+against the pinned checkpoint revision; this machine never holds the
+full checkpoint), not a local safetensors file. Three: digest cadence
+— hashing 20 GB on every step would cost seconds per step; digests are
+verified at pack time and once per blob on FIRST touch by the reader
+thread (amortized into step one's traffic), after which the immutable
+mapping is trusted. Four: the review's bracketed citations point at an
+unrelated ROCm/JAX compatibility page; the numbers it quotes are from
+our own run logs, which is where evidence lives here.
+
+One design decision the contract did not cover, decided now: upstream
+carves per-tensor views out of one raw device buffer, but PJRT
+executables consume separate typed buffers, and the view-carving
+equivalent (PJRT_Client_CreateViewOfDeviceBuffer) is unproven on this
+plugin. So the ring uploads PER TENSOR from the pinned blob slot —
+~44 transfers per block instead of one — and the single-DMA carve
+upgrade is deferred to the perf pass alongside the async transfer
+manager. The blob layout is contract-fixed now so that upgrade needs
+no repack.
+
+Structure being built. tools/pack_block.py: block dir in, one
+contiguous 64-byte-aligned blob plus manifest out (canonical
+name-sorted order, per-entry offset/nbytes/dtype/shape/sha256, blob
+sha256, source revision, packer version; no timestamps — the output
+is deterministic to the byte). ltx/block.zig: the Block/Chain graph
+definitions REFACTORED OUT of block_conformance.zig into the shared
+module the engine will import — gated by the full 22-gate conformance
+suite reproducing exactly after the move. ltx/loader.zig: the ring —
+two pinned host slots (dmaMap), one mmap reader thread, device sets
+uploaded serially per E-STREAM-2's verdict, slot states {free,
+filling, ready, in_use} asserted on every transition, the 48-entry
+schedule statically checked against ring capacities at startup before
+any I/O. ltx/ring_dryrun.zig: the E-STREAM-3 binary.
+
+Gates, pre-registered:
+
+G-RING-1 packer determinism: packing the same block twice yields
+identical blob digests. G-RING-2 manifest integrity: no gaps, no
+overlaps, canonical order, sizes exact, every entry accounted for.
+G-RING-3 byte fidelity: every tensor served by the ring compares
+equal (memcmp) to a direct read of the source files, all three
+blocks. G-RING-4 lifecycle: an intentionally SLOW consumer forces
+ring-full backpressure (the reader must park, never overwrite) and a
+fast consumer forces ring-empty (the consumer parks); both runs
+complete with every transition legal and zero steady-state
+allocation. G-RING-5: the static schedule check runs and passes
+before the first byte of I/O. G-RING-6 the engine gate: chainB47
+computed from ring-loaded buffers equals the same graph on
+direct-loaded buffers BITWISE (same bytes in, same executable, so
+any difference is a loader bug); then block 0's fully-quantized
+blockOut, same comparison, through the quantized blob entries.
+
+H-RING-1: byte-exact everywhere — the loader only moves bytes, so
+G-RING-3 and G-RING-6 admit zero tolerance. H-RING-2: per-tensor
+pinned upload lands within 20% of the whole-blob 31 ms (transfer
+setup is per-call cheap at ~14 MB mean tensor size). H-RING-3:
+dmaMap on the FILE-BACKED mmap region fails (host registration of
+file-backed pages is typically unsupported), and the memcpy into the
+anonymous pinned ring — the design-note staging — is the path;
+measured either way by trying it first.
+
+## 2026-08-21, continued — E-STREAM-3: all gates pass; pre-assembly is COMPLETE
+
+Build receipts first. tools/pack_block.py packed blocks 0/23/47 into
+blobs (44/28/28 entries — block 0 carries its int8-g128 companions);
+repacking block 0 reproduced digest c0d8351050b949fa… exactly
+(G-RING-1). The Block/Chain/QBlock definitions moved out of the
+harness into the shared ltx/block.zig the engine will import, and the
+full 22-gate conformance suite reproduced every number to the digit
+after the move (blockOut 1.843e-6, chain 2.735e-6, quantized block
+5.237e-3) — the regression fence held. Three bugs between first build
+and green, each caught in seconds by the gates: a JSON parser default
+that left manifest strings pointing into a freed buffer (segfault on
+the first print; fix: parse with alloc_always), a slot stride that
+wasn't page-aligned (alignment panic on slot 1; fix: align-forward
+stride), and nothing else — the lifecycle and the GPU gates ran clean
+on the first complete attempt.
+
+The gate sheet: G-RING-2 layout OK for all three blobs, revision
+6c7e5e573ac1 bound and checked. G-RING-5 static check before any I/O:
+6-entry schedule, peak occupancy 2 of 2 slots. G-RING-4 slow
+consumer: the reader parked 4 times on a full ring and never
+overwrote; fast consumer: the consumer parked 6 times on an empty
+ring and the reader never parked; both completed, every transition
+legal. G-RING-3: every served entry matched its packed digest on
+both passes. G-RING-6, the engine gate: **chainB47 fed by ring-loaded
+buffers is BITWISE EQUAL to the direct-loaded control, and so is the
+fully-quantized qBlockOutAll through the quantized blob entries.**
+The ring is invisible to the mathematics, which is the whole job.
+
+Now the findings, one per hypothesis, two of three refuted:
+
+H-RING-3 REFUTED, pleasantly: dmaMap on the file-backed mmap
+SUCCEEDED on this plugin. The pinned host ring's memcpy stage may be
+removable entirely — pin the mapping, upload straight from the page
+cache, zero host copies. Filed for the perf pass rather than adopted
+now (the interaction between pinned file pages and 20 GB of cache
+eviction under 15 GB of RAM needs its own measurement — pinning
+fights the very page reclaim the overflow design relies on, so this
+is NOT obviously free at full scale; at three blocks it would be).
+
+H-RING-2 REFUTED: per-tensor uploads reached 4.24 GB/s against the
+whole-blob 14.4 — a 3.4× penalty, not the predicted <20%. The cause
+is visible in the harness: each fromBytes waits its transfer to
+completion (wait=true), so ~100 transfers pay ~100 full round-trip
+latencies. Named fix, filed for assembly: issue the block's uploads
+wait=false and await them together — the DMAs pipeline and most of
+the penalty should vanish. Even unfixed: 146 ms per block, ~7 s per
+48-block step against ~60 s of compute. Not blocking; not ignored.
+
+And an unregistered cost surprise: first-touch digest verification of
+1.8 GB took 48.6 seconds — ~38 MB/s, which is SOFTWARE SHA-256 on a
+baseline-x86_64 build (the hermetic toolchain doesn't emit SHA-NI).
+At engine scale that would be ~9 minutes over 20 GB. Decision:
+pack-time digests stay mandatory, runtime first-touch verification
+becomes opt-in, and a SIMD-friendly hash (BLAKE3) or a -Dcpu bump is
+filed for when runtime verification is wanted. The memcpy stage
+itself is healthy: ~12 GB/s into pinned slots.
+
+**Phase 3 pre-assembly is COMPLETE.** E3w conformant in the block,
+scheduler bit-exact, quantization recipe settled, transfer facts
+measured, ring gated end-to-end with the real graphs. What remains is
+the 48-block assembly itself: fetch and quantize the other 45 blocks,
+pack 48 blobs, stage-walk early/middle/late, then the full stream —
+every component of which now has receipts.

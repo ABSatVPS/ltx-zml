@@ -25,6 +25,7 @@ zig_binary(
 zig_binary(
     name = "block_conformance",
     main = "block_conformance.zig",
+    srcs = ["block.zig"],
     visibility = ["//visibility:public"],
     deps = [
         "//zml",
@@ -45,6 +46,20 @@ zig_binary(
 zig_binary(
     name = "stream_smoke",
     main = "stream_smoke.zig",
+    visibility = ["//visibility:public"],
+    deps = [
+        "//zml",
+    ],
+)
+
+# E-STREAM-3: the streaming ring's three-block dry run (0/23/47).
+zig_binary(
+    name = "ring_dryrun",
+    main = "ring_dryrun.zig",
+    srcs = [
+        "block.zig",
+        "loader.zig",
+    ],
     visibility = ["//visibility:public"],
     deps = [
         "//zml",

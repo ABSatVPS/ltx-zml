@@ -69,17 +69,20 @@ conditioning arrives as precomputed embeddings (Phase 4 runs offline
 first). Audio stream stubbed out — the checkpoint's bridges are
 skipped, accepting divergence from joint generation until Phase 7.
 
-Landed so far: the 0/23/47 chain conforms with sub-linear error growth
-(2.68e-6 at three blocks); the quantization recipe is settled
-(int8-g128 large projections, fully quantized block at the bf16
-floor); the streaming loader is designed (notebook, ring-lifecycle
-contract); the E3w while-loop attention — the only attention that
-fits at T≈28k — is swapped into the block path and gated (agreement
-with dense 1.09e-6, oracle conformance unchanged); and the distilled
-scheduler is reproduced BIT-EXACTLY by ltx/scheduler.zig — 94/94
-gates across both stages, both modalities, every update — including
-the fused-lerp kernel semantics the reference's own header doesn't
-show. Remaining: the streaming loader build, then 48-block assembly.
+Pre-assembly COMPLETE (2026-08-21): the 0/23/47 chain conforms with
+sub-linear error growth (2.68e-6 at three blocks); the quantization
+recipe is settled (int8-g128 large projections, fully quantized block
+at the bf16 floor); the E3w while-loop attention — the only attention
+that fits at T≈28k — is swapped into the block path and gated
+(agreement with dense 1.09e-6, oracle conformance unchanged); the
+distilled scheduler is reproduced BIT-EXACTLY by ltx/scheduler.zig
+(94/94 gates, including the fused-lerp kernel semantics the
+reference's own header doesn't show); and the streaming loader is
+BUILT and gated — pack_block blobs, mmap → pinned ring → serial
+uploads, lifecycle asserted, and the real chain and quantized-block
+graphs fed through the ring bitwise-equal to direct loads. Remaining:
+the 48-block assembly itself — fetch/quantize/pack the other 45
+blocks, stage-walk early/middle/late, then the full stream.
 
 Done means: latents for a fixed seed and fixed precomputed conditioning
 match the reference pipeline's within tolerance, step by step, and a
