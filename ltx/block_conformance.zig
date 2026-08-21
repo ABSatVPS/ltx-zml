@@ -504,6 +504,10 @@ const QBlock = struct {
     k2s: zml.Tensor,
     v2q: zml.Tensor,
     v2s: zml.Tensor,
+    f1q: zml.Tensor,
+    f1s: zml.Tensor,
+    f2q: zml.Tensor,
+    f2s: zml.Tensor,
 
     fn qkRoped(self: @This(), n: zml.Tensor, cos: zml.Tensor, sin: zml.Tensor) struct { q3: zml.Tensor, k3: zml.Tensor } {
         const q = rmsW(linQ(n, self.q1q, self.q1s, self.base.q1_b), self.base.qn1);
@@ -535,6 +539,50 @@ const QBlock = struct {
         out = out.mul(glog.sigmoid().scale(2.0).broad(out.shape()));
         const merged = out.transpose(.{ .q, .h, .hd }).reshape(zml.Shape.init(.{ .t = T, .i = D }, .f32));
         return lin(merged, self.base.o1_w, self.base.o1_b);
+    }
+
+    fn qFf(self: @This(), ff_in: zml.Tensor) zml.Tensor {
+        return linQ(linQ(ff_in, self.f1q, self.f1s, null).gelu(), self.f2q, self.f2s, null);
+    }
+
+    /// FFN-isolated probe: the f32 path up to the REAL ff_in, then the
+    /// quantized FFN — so the comparison against f32 s7FfOut sees only
+    /// this class's error.
+    pub fn qFfOut(self: @This(), x: zml.Tensor, ts3: zml.Tensor, ctx: zml.Tensor, pts2: zml.Tensor, cos: zml.Tensor, sin: zml.Tensor) zml.Tensor {
+        return self.qFf(self.base.s6FfIn(x, ts3, ctx, pts2, cos, sin));
+    }
+
+    /// The whole block with quantized qkv AND quantized FFN.
+    pub fn qBlockOutAll(self: @This(), x: zml.Tensor, ts3: zml.Tensor, ctx: zml.Tensor, pts2: zml.Tensor, cos: zml.Tensor, sin: zml.Tensor) zml.Tensor {
+        const b = self.base;
+        const gate_msa = adaVal(b.sst, ts3, 2);
+        const x_sa = x.add(self.qAttn1(x, ts3, cos, sin).mul(gate_msa));
+        const x_normed = rmsNoW(x_sa);
+        const shift_q = adaVal(b.sst, ts3, 6);
+        const scale_q = adaVal(b.sst, ts3, 7);
+        const gate_ca = adaVal(b.sst, ts3, 8);
+        const attn_in = modulate(x_normed, scale_q, shift_q);
+        const kv = b.psst.convert(.f32).add(pts2);
+        const shift_kv = kv.slice1d(.n, .{ .start = 0, .end = 1 }).squeeze(.n);
+        const scale_kv = kv.slice1d(.n, .{ .start = 1, .end = 2 }).squeeze(.n);
+        const enc = ctx.mul(scale_kv.broad(ctx.shape()).addConstant(1.0)).add(shift_kv.broad(ctx.shape()));
+        const q = rmsW(linQ(attn_in, self.q2q, self.q2s, b.q2_b), b.qn2);
+        const k = rmsW(linQ(enc, self.k2q, self.k2s, b.k2_b), b.kn2);
+        const v = linQ(enc, self.v2q, self.v2s, b.v2_b);
+        const q3 = q.reshape(zml.Shape.init(.{ .q = T, .h = H, .hd = HD }, .f32));
+        const k3 = k.reshape(zml.Shape.init(.{ .k = S, .h = H, .hd = HD }, .f32));
+        const v3 = v.reshape(zml.Shape.init(.{ .k = S, .h = H, .hd = HD }, .f32));
+        var ca = zml.nn.sdpa(q3, k3, v3, .{});
+        const glog = lin(attn_in, b.g2_w, b.g2_b).withTags(.{ .q, .h });
+        ca = ca.mul(glog.sigmoid().scale(2.0).broad(ca.shape()));
+        const merged = ca.transpose(.{ .q, .h, .hd }).reshape(zml.Shape.init(.{ .t = T, .i = D }, .f32));
+        const ca_out = lin(merged, b.o2_w, b.o2_b).mul(gate_ca);
+        const x_ca = x_sa.add(ca_out);
+        const shift_mlp = adaVal(b.sst, ts3, 3);
+        const scale_mlp = adaVal(b.sst, ts3, 4);
+        const gate_mlp = adaVal(b.sst, ts3, 5);
+        const ff_in = modulate(rmsNoW(x_ca), scale_mlp, shift_mlp);
+        return x_ca.add(self.qFf(ff_in).mul(gate_mlp));
     }
 
     /// Probe 3: the whole block with int4 qkv in BOTH attentions.
@@ -780,6 +828,8 @@ pub fn main(init: std.process.Init) !void {
         .{ .field = "q2q", .s = .{ .qf = "attn2_to_q_weight_q8.bin", .sf = "attn2_to_q_weight_q8scale.bin", .dims = .{ D, D } } },
         .{ .field = "k2q", .s = .{ .qf = "attn2_to_k_weight_q8.bin", .sf = "attn2_to_k_weight_q8scale.bin", .dims = .{ D, D } } },
         .{ .field = "v2q", .s = .{ .qf = "attn2_to_v_weight_q8.bin", .sf = "attn2_to_v_weight_q8scale.bin", .dims = .{ D, D } } },
+        .{ .field = "f1q", .s = .{ .qf = "ff_net_0_proj_weight_q8.bin", .sf = "ff_net_0_proj_weight_q8scale.bin", .dims = .{ FF, D } } },
+        .{ .field = "f2q", .s = .{ .qf = "ff_net_2_weight_q8.bin", .sf = "ff_net_2_weight_q8scale.bin", .dims = .{ D, FF } } },
     };
     var qmodel: QBlock = undefined;
     var qbufs: zml.Bufferized(QBlock) = undefined;
@@ -815,6 +865,8 @@ pub fn main(init: std.process.Init) !void {
         .{ .fm = "fLogits", .qm = "qLogits", .budget = 5e-2, .len = logits_len, .full = false },
         .{ .fm = "s3Attn1", .qm = "qAttn1", .budget = 2e-2, .len = out_len, .full = false },
         .{ .fm = "blockOut", .qm = "qBlockOut", .budget = 2e-2, .len = out_len, .full = true },
+        .{ .fm = "s7FfOut", .qm = "qFfOut", .budget = 5e-2, .len = out_len, .full = true },
+        .{ .fm = "blockOut", .qm = "qBlockOutAll", .budget = 2e-2, .len = out_len, .full = true },
     };
     inline for (probes) |p| {
         const fmethod = comptime std.meta.stringToEnum(std.meta.DeclEnum(Block), p.fm).?;
@@ -865,7 +917,7 @@ pub fn main(init: std.process.Init) !void {
     }
 
     if (all_pass) {
-        log.info("BLOCK CONFORMANCE: ALL GATES PASS (single block + 0/23/47 chain + quantized qkv)", .{});
+        log.info("BLOCK CONFORMANCE: ALL GATES PASS (single block + chain + fully quantized block)", .{});
     } else {
         log.err("BLOCK CONFORMANCE: FAILURES ABOVE", .{});
         return error.ConformanceFailed;

@@ -1137,3 +1137,53 @@ usually better-behaved — measured, not assumed, next); gates, norms,
 tables, biases f32 forever. Memory arithmetic at that split: roughly
 13 GB for the full dual-stream DiT — on-card, with block streaming as
 backstop.
+
+## 2026-08-22, continued — FFN class rung, budgets pre-registered
+
+The stakes make this rung the load-bearing one for residency: the FFN
+pair is the parameter bulk (134M per video block). All-int8 puts the
+DiT near 21 GB (streamed, not resident); attention-int8 plus FFN-int4
+lands near 13 GB (resident). So int4-FFN is the difference between a
+resident model and a streamed one — both viable (streaming is proven
+roadmap tech), but resident is simpler and faster.
+
+Budgets before the diff: FFN-isolated probe (f32 prefix up to the real
+ff_in, int4-g128 FFN applied, compared against the f32 s7FfOut) ≤
+5e-2 — looser than attention's 2e-2 because the FFN output enters
+through a gated residual and dilutes at block level; the block gate is
+what binds. Full block with int8-qkv AND int4-FFN ≤ 2e-2, same as
+before. Hypothesis: FFN weight distributions are the well-behaved ones
+(the qkv outlier pathology is attention-specific in most transformers)
+— weight rel-RMS ~0.05–0.10, ff_out similar, block diluted ~2×.
+Escalation if it fails: int8 FFN and block streaming — the trade
+recorded above, no drama either way.
+
+## 2026-08-22, continued — FFN rung: hypothesis refuted, recipe settled
+
+The FFN-weights-are-well-behaved hypothesis died in weight space before
+a probe ran: int4-g128 measured rel-RMS 0.187/0.213 on the FFN pair —
+as pathological as the attention matrices. **The outlier structure is
+model-wide in LTX-2.5, not attention-specific.** Probe skipped under
+the same justified-skip protocol as ladder rung 3 (a 6× weight-space
+gap cannot pass downstream), and the pre-recorded escalation taken:
+int8-g128 FFN, accepting the residency consequence.
+
+Int8 results: FFN weight error 0.011/0.013 (same profile as the
+passing qkv class). Probes: FFN-isolated 2.07e-3 against its 5e-2
+budget — 24× inside; and the FULLY QUANTIZED block (int8-g128
+attention and FFN together) at **5.24e-3 — statistically at the
+reference's own bf16 deployment floor of 5.9e-3.** Quantizing the FFN
+added five parts in ten thousand to block error. Nineteen gates green.
+
+The settled recipe, receipt-backed: int8-g128 for every large
+projection, f32 for gates/norms/tables/biases, dequant in-graph.
+Consequence accepted and priced: the DiT weighs ~20 GB quantized —
+streamed through the deterministic block-prefetch design rather than
+resident. The residency dream at int4 dies on the model's actual
+weight statistics; the rotation rung (Lightricks's own convrot road,
+with working fold machinery in the coli-zml snapshot as prior art)
+stays open as the future play that could halve that again.
+
+Phase 3's quantization item is closed. Remaining before the 48-block
+assembly: the E3w attention swap behind its overlap-domain gate, the
+scheduler comparison, and the block-streaming loader.
