@@ -30,9 +30,12 @@ const O: i64 = 2048;
 const K: i64 = 6144;
 const S_LIST = [_]i64{ 1, 8, 64, 512, 4096, 28672 };
 
-// Attention geometry — VERIFIED against LTX-2's ltx-core
-// model_configurator.py defaults (video stream: 32 heads x 128 head dim,
-// hidden 4096, 48 layers; audio stream 32 x 64). Runs 1-6 used H=16.
+// Attention geometry — CONFIRMED against the LTX-2.5 checkpoint itself
+// (safetensors metadata, model_version 2.5.0): video stream 32 heads x
+// 128 head dim, hidden 4096, 48 blocks; audio stream 32 x 64. The
+// checkpoint also sets apply_gated_attention=true (per-head sigmoid
+// gates on every attention) and ff_bias=false with a 4x GELU FFN —
+// engine-relevant, not smoke-relevant. Runs 1-6 used H=16.
 const H: i64 = 32;
 const HD: i64 = 128;
 const T_LIST = [_]i64{ 512, 1024, 4096, 8192, 16384, 28672 };

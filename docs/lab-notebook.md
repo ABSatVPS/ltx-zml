@@ -652,3 +652,57 @@ the catch wraps compile and execute both, and that the cap (committed)
 avoids the attempt entirely. The stack traces after SMOKE COMPLETE are
 the debug allocator reporting the deliberately never-freed platform and
 executables — cosmetic.
+
+## 2026-08-21 — the checkpoint speaks: exact LTX-2.5 architecture, from the source
+
+With the HF gate passed, a 677 KB range-request on the distilled bf16
+transformer's safetensors header delivered what the gated repo had been
+withholding: the full tensor manifest (4,349 tensors) and — because
+LTX stores its config in the checkpoint metadata — the exact
+architecture, model_version 2.5.0. No weights downloaded.
+
+The measured facts. Total: **21.004 B parameters** in the DiT file
+(the "22B" of the marketing rounds up), split 14.865 B video/shared and
+6.139 B audio — the LTX-2 paper's 14B+5B asymmetric pair, with the
+audio side grown. Both streams run the same **48 blocks**: video at
+hidden 4096 (32 heads × 128 — our smoke geometry confirmed exactly),
+audio at hidden 2048 (32 × 64), video↔audio cross-attention operating
+in the 2048 space with per-side projections, all attention carrying
+RMS qk-norm, biased QKV, and per-block 9-entry AdaLN tables driven by
+a shared timestep embedder.
+
+Three discoveries the configurator defaults did NOT show, each
+engine-relevant:
+
+First, **apply_gated_attention = true**: every attention — self,
+cross, and the audio↔video bridges — has a `to_gate_logits` [32,
+hidden] projection, one logit per head. Attention output is gated
+per-head before the output projection. Cheap elementwise work that
+fuses trivially, but the transformer-block oracle test will fail
+mysteriously if it's forgotten, so it is recorded here in bold.
+
+Second, the video FFN is **bias-free at 4× width** (16384,
+gelu-approximate) while the audio FFN keeps biases at 8192 — the
+ff_bias=false flag from the code applies to the video stream only.
+
+Third, the prompt path is heavier than assumed: Gemma 4 12B output
+(3840-wide) feeds **8-block connector transformers with 128 learnable
+registers per stream** before it ever reaches cross-attention. The
+connectors are full attention stacks (32 × 128 heads, gated, max_pos
+4096) — a real sub-model, not a linear projection. And this
+checkpoint does NOT set use_prompt_adaln_single=false, so the prompt
+K/V here is timestep-dependent — the KV-cache-across-steps trick
+noted earlier applies only to the separately-shipped kv-cacheable
+checkpoints, not this one. Earlier optimism corrected.
+
+Also pinned: RoPE frequencies are computed in **float64**
+(frequencies_precision) with theta 10000 over max positions
+[20, 2048, 2048] and causal temporal positioning — fine for us, since
+the plan bakes position tables at trace time where f64 precision is
+free. norm_eps 1e-6, RMS everywhere, norm_elementwise_affine=false.
+
+The genesis entry's last "to verify" item is now closed. Milestone 5
+(one transformer block, conformant against the HF implementation) has
+an exact blueprint: patchify 128→4096, 48× [gated self-attn with 3D
+RoPE + gated cross-attn against connector output + bias-free 4× GELU
+FFN, AdaLN-modulated], with the audio stream and bridges alongside.
