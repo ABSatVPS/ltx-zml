@@ -1880,3 +1880,131 @@ counts as done only if its blob manifest records the pinned revision
 and its blob matches the recorded digest, so interruptions cost
 nothing. Skip-if-done verified against blocks 0 and 23 before launch.
 Launched for blocks 0–47; the three existing blocks skip, 45 fetch.
+
+## 2026-08-21, evening — 48 blocks on disk; the assembly checkpoint, pre-registered
+
+The fetch pipeline finished clean: 48 blob manifests, every one
+digest-verified against the pinned revision, ~45 s per block
+end-to-end, .work at 71 GB against the projected 75. The resumability
+clause earned its keep involuntarily — an early launch was killed ten
+minutes in by my own process-management mistake and the rerun picked
+up its 12 completed blocks without re-downloading a byte.
+
+Now the checkpoint this was all for: THE 48-BLOCK STAGE-WALK. The
+design decision first, because it defines what "the engine" means
+here. The assembly does NOT trace 48 blocks into one graph — that way
+lies the comptime quota blowup, a 20 GB-resident executable, and none
+of the streaming machinery earning anything. Instead the engine
+compiles ONE block executable (the uniform geometry pays again: same
+shapes, same graph, all 48 blocks) and calls it 48 times, the ring
+feeding each call's weight buffers, the activation x staying on
+device between calls. That is the production execution model, run for
+the first time.
+
+The oracle side: tools/make_full_chain_bundle.py extends the chain
+oracle to all 48 blocks — torch CPU f64, one block loaded at a time,
+same frozen inputs as everything since Phase 2, dumping the running x
+after blocks 7, 15, 23, 31, 39, and 47 (the stage-walk checkpoints:
+early, four interior stations, and the end). Two controls are free
+and mandatory: block 0's output must equal the Phase 2 bundle's
+block_out.bin EXACTLY (same code path, same inputs), and the
+0→23→47 subsequence cannot be checked directly (the full chain runs
+blocks BETWEEN them) — so instead the generator re-asserts the
+existing 3-chain bundle stays reproducible before writing anything.
+
+Gates, pre-registered before the oracle runs:
+
+G-ASM-1, control: engine x after block 0 vs the Phase 2 oracle
+block_out — the standard 2e-3 gate, expected at the known 1.8e-6.
+G-ASM-2 through G-ASM-7: engine x vs oracle at the six checkpoints,
+2e-3 gates each. Expected error: sub-linear growth has held from one
+block (1.84e-6) to three (2.74e-6); if it continues ~√depth the
+48-block end lands near 1e-5, two hundred times inside the budget.
+Registered decision rule: if any interior checkpoint jumps an order
+of magnitude over its predecessor, stop and bisect blocks — the gate
+placement exists precisely to localize a bad block to one sixth of
+the model.
+
+H-ASM-1: all seven gates pass with the end-state near 1e-5.
+H-ASM-2, measured not gated: the fully-quantized engine walk (int8
+recipe per block, same streaming) vs the f32 engine walk. Single
+block measured 5.24e-3 ≈ the bf16 floor; how per-block quantization
+noise COMPOUNDS over 48 blocks is the number that decides whether
+the recipe survives assembly — pre-registered expectation: sub-linear
+again, final rel-RMS in the low tenths at worst (√48 × 5.24e-3 ≈
+3.6e-2 if it random-walks; linear 48× ≈ 2.5e-1 would be trouble).
+No pass/fail line on H-ASM-2 — it calibrates the Phase 6 fidelity
+budget instead.
+
+Timing rides along for free: per-block upload and compute, end-to-end
+wall time for a 48-block pass at T=64, and the ring's stall count —
+the first real numbers for the streaming engine's overhead model.
+
+## 2026-08-21, night — the 48-block stage-walk PASSES, and the model forgives quantization
+
+The verdict first: **48-BLOCK STAGE-WALK: ALL ORACLE GATES PASS.**
+The production execution model — one compiled block executable, 48
+calls, ring-streamed weights, activation resident on device — matches
+the torch f64 oracle at every checkpoint. The full engine now exists
+in miniature.
+
+H-ASM-1, confirmed almost exactly as registered. The f32 trajectory:
+9.88e-6 at block 7, 1.82e-5 at 15, 1.77e-5 at 23, 1.48e-5 at 31,
+1.42e-5 at 39, **1.48e-5 at 47** — against a predicted ~1e-5 endpoint
+and a 2e-3 budget, so 135× inside. The shape is the story: error
+grows for the first third and then PLATEAUS — the per-block noise
+random-walks and partially cancels rather than accumulating. Rerun
+reproduced every gate digit-for-digit.
+
+H-ASM-2, answered better than either registered scenario. The
+fully-quantized walk: 3.51e-2 at block 7, peaks at 3.89e-2 at block
+15, then DECLINES monotonically — 3.81e-2, 3.20e-2, 3.04e-2,
+**2.84e-2 at block 47.** Below the √48 random-walk estimate (3.6e-2),
+an order of magnitude under the 2.5e-1 trouble line, and the decline
+means the network actively attenuates accumulated quantization noise
+in its second half — the single-block softmax-attenuation finding,
+operating at model scale. The int8-g128 recipe survives assembly at
+~2.8e-2 rel-RMS end-to-end; that number now calibrates Phase 6's
+fidelity budget. (Quant-vs-f32-engine and quant-vs-oracle agree to
+four digits at every checkpoint — as they must, since the f32 engine
+sits 1e-5 from the oracle.)
+
+Timing, the first real overhead model: 54.8 s wall for a 48-block f32
+pass, of which uploads are 2.2 s and compute-plus-sync 1.0 s (T=64).
+The other ~50 s is DISK-TO-STAGING: the reader never parked while the
+consumer parked 48 times, and 26 GB through cold-cache mmap page
+faults runs at ~430 MB/s — nowhere near NVMe streaming rates. The
+kernel is not readahead-ing this access pattern; madvise(SEQUENTIAL)
+or pread-based staging is the named lever, filed for the perf pass.
+At production T≈28k the compute term grows a thousandfold while the
+staging term stays fixed, so this is a first-step tax, not a
+steady-state one — but it is also why time-to-first-latent will care.
+
+Two bugs on the road, both instructive. First, run 1 stalled for an
+hour and the diagnosis (gdb, thread states) found MY teardown
+deadlocked: an error mid-walk propagated through `defer reader.join()`
+while the reader was parked on a condition nobody would signal. The
+ring gained abort() — consumer-side teardown that retires the reader
+before the join — and the error path is now proven (run 2's failure
+exited cleanly in seconds). Second, the error itself: blobs 23 and 47
+PREDATED the assembly pipeline — packed during the ring dry run,
+before their blocks were ever quantized — and the pipeline's resume
+logic correctly honored its own contract (revision + digest valid)
+and skipped them. The quant walk then reached for int8 entries that
+did not exist. The contract was incomplete, not the code: done() now
+also requires the full 44-entry schema. And a free gate from the fix:
+block 23's repack reordered the blob layout, and the f32 walk
+reproduced bit-identically through it — the loader is provably
+layout-independent, serving by name and offset.
+
+Also relearned, for the third time, in a new costume: never filter a
+long-running process through a block-buffered pipe. Run 1's actual
+error sat in grep's buffer for an hour while I diagnosed a "hang."
+
+**The Phase 3 assembly checkpoint is closed.** What remains for the
+phase's "done means" — latents matching the reference step-by-step
+through a full denoising pass on the card — is composition of
+now-gated parts plus the named remainder: the non-block tensors
+(patchify/adaln/final projections, 4.89 GB, mapped in the audit), the
+scheduler loop driving 48-block passes at production T, and the E3w
+kernel doing its production job at that length.

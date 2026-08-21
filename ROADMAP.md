@@ -80,9 +80,19 @@ distilled scheduler is reproduced BIT-EXACTLY by ltx/scheduler.zig
 reference's own header doesn't show); and the streaming loader is
 BUILT and gated — pack_block blobs, mmap → pinned ring → serial
 uploads, lifecycle asserted, and the real chain and quantized-block
-graphs fed through the ring bitwise-equal to direct loads. Remaining:
-the 48-block assembly itself — fetch/quantize/pack the other 45
-blocks, stage-walk early/middle/late, then the full stream.
+graphs fed through the ring bitwise-equal to direct loads.
+
+ASSEMBLY CHECKPOINT PASSED (2026-08-21): all 48 blocks fetched,
+quantized, packed, and digest-verified against the pinned revision;
+the production execution model (ONE compiled block executable, 48
+calls, ring-streamed weights) matches the torch f64 oracle at six
+stage-walk checkpoints — 1.48e-5 at depth 48 vs a 2e-3 budget, error
+plateauing rather than accumulating — and the fully-quantized walk
+lands at 2.84e-2 end-to-end, DECLINING through the model's second
+half: the int8-g128 recipe survives assembly. Remaining for the
+phase's done-means: the non-block tensors (4.89 GB: patchify, adaln,
+final projections), the bit-exact scheduler driving 48-block passes
+at production T, and the E3w kernel at production length.
 
 Done means: latents for a fixed seed and fixed precomputed conditioning
 match the reference pipeline's within tolerance, step by step, and a

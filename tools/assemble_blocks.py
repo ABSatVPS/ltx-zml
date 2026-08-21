@@ -22,6 +22,12 @@ TOOLS = pathlib.Path(__file__).parent
 PINNED_REVISION = "6c7e5e573ac1667efc83407806fe9b0b93730e60"
 
 
+# 28 base tensors + 8 q8 + 8 q8scale: a blob missing its quant entries is
+# NOT done — blocks 23/47, packed before the quantize step existed, passed
+# the original revision+digest check and sank the first quant stage-walk.
+EXPECTED_ENTRIES = 44
+
+
 def done(bdir: pathlib.Path) -> bool:
     mf = bdir / "blob_manifest.json"
     if not mf.exists():
@@ -29,6 +35,9 @@ def done(bdir: pathlib.Path) -> bool:
     m = json.loads(mf.read_text())
     if m.get("revision") != PINNED_REVISION:
         print(f"  {bdir.name}: blob from revision {m.get('revision')!r} != pinned — refetching")
+        return False
+    if len(m.get("entries", [])) != EXPECTED_ENTRIES:
+        print(f"  {bdir.name}: blob has {len(m.get('entries', []))} entries, expected {EXPECTED_ENTRIES} — repacking")
         return False
     blob = bdir / "blob.bin"
     if not blob.exists() or blob.stat().st_size != m["total_bytes"]:

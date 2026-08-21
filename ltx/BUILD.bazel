@@ -52,6 +52,21 @@ zig_binary(
     ],
 )
 
+# Assembly checkpoint: the 48-block stage-walk — one block executable
+# called 48 times over ring-streamed weights, gated vs the f64 oracle.
+zig_binary(
+    name = "walk48",
+    main = "walk48.zig",
+    srcs = [
+        "block.zig",
+        "loader.zig",
+    ],
+    visibility = ["//visibility:public"],
+    deps = [
+        "//zml",
+    ],
+)
+
 # E-STREAM-3: the streaming ring's three-block dry run (0/23/47).
 zig_binary(
     name = "ring_dryrun",

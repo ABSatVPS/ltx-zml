@@ -11,6 +11,7 @@
 //! pinned staging, which the reader thread DOES overlap with compute.
 const std = @import("std");
 const zml = @import("zml");
+const blk = @import("block.zig");
 
 const log = std.log;
 
@@ -96,6 +97,80 @@ pub fn sha256Hex(bytes: []const u8) [64]u8 {
     return std.fmt.bytesToHex(d, .lower);
 }
 
+/// Normalize a blob entry name to the harness file-stem convention:
+/// '.' -> '_', "::q8scale" -> "_q8scale", "::q8" -> "_q8".
+pub fn normalizeName(out: []u8, name: []const u8) []const u8 {
+    var n: usize = 0;
+    var i: usize = 0;
+    while (i < name.len) : (i += 1) {
+        if (name[i] == ':' and i + 1 < name.len and name[i + 1] == ':') {
+            out[n] = '_';
+            n += 1;
+            i += 1; // skip the second ':'
+        } else if (name[i] == '.') {
+            out[n] = '_';
+            n += 1;
+        } else {
+            out[n] = name[i];
+            n += 1;
+        }
+    }
+    return out[0..n];
+}
+
+/// Find a blob entry by its normalized harness name.
+pub fn findEntry(blob: *const Blob, want: []const u8) !Entry {
+    var nbuf: [256]u8 = undefined;
+    for (blob.manifest.entries) |e| {
+        if (std.mem.eql(u8, normalizeName(&nbuf, e.name), want)) return e;
+    }
+    log.err("blob {d}: no entry named {s}", .{ blob.manifest.block, want });
+    return error.MissingEntry;
+}
+
+/// Build one block's device buffers from a memory region laid out per the
+/// blob manifest (either a ring slot or the mmap itself for direct mode).
+pub fn buildBlockBufs(io: std.Io, platform: *zml.Platform, blob: *const Blob, mem: []const u8, block_idx: i64) !zml.Bufferized(blk.Block) {
+    var bufs: zml.Bufferized(blk.Block) = undefined;
+    var namebuf: [256]u8 = undefined;
+    inline for (blk.WEIGHT_SPECS) |spec| {
+        const stem = comptime spec.file[0 .. spec.file.len - 4]; // drop ".bin"
+        const want = try std.fmt.bufPrint(&namebuf, "transformer_blocks_{d}_{s}", .{ block_idx, stem });
+        const e = try findEntry(blob, want);
+        const data = mem[e.offset .. e.offset + e.nbytes];
+        @field(bufs, spec.field) = try zml.Buffer.fromBytes(io, platform, blk.weightShape(spec), .replicated, data);
+    }
+    return bufs;
+}
+
+pub const Q8Spec = struct { field: []const u8, stem: []const u8, dims: [2]i64 };
+pub const Q8_SPECS = [_]Q8Spec{
+    .{ .field = "q1q", .stem = "attn1_to_q_weight", .dims = .{ blk.D, blk.D } },
+    .{ .field = "k1q", .stem = "attn1_to_k_weight", .dims = .{ blk.D, blk.D } },
+    .{ .field = "v1q", .stem = "attn1_to_v_weight", .dims = .{ blk.D, blk.D } },
+    .{ .field = "q2q", .stem = "attn2_to_q_weight", .dims = .{ blk.D, blk.D } },
+    .{ .field = "k2q", .stem = "attn2_to_k_weight", .dims = .{ blk.D, blk.D } },
+    .{ .field = "v2q", .stem = "attn2_to_v_weight", .dims = .{ blk.D, blk.D } },
+    .{ .field = "f1q", .stem = "ff_net_0_proj_weight", .dims = .{ blk.FF, blk.D } },
+    .{ .field = "f2q", .stem = "ff_net_2_weight", .dims = .{ blk.D, blk.FF } },
+};
+
+pub fn buildQuantBufs(io: std.Io, platform: *zml.Platform, blob: *const Blob, mem: []const u8, block_idx: i64, base: zml.Bufferized(blk.Block), qbufs: *zml.Bufferized(blk.QBlock)) !void {
+    qbufs.base = base;
+    var namebuf: [256]u8 = undefined;
+    inline for (Q8_SPECS) |qs| {
+        const wq = try std.fmt.bufPrint(&namebuf, "transformer_blocks_{d}_{s}_q8", .{ block_idx, qs.stem });
+        const eq = try findEntry(blob, wq);
+        const qshape = zml.Shape.init(.{ .o = qs.dims[0], .i = qs.dims[1] }, .i8);
+        @field(qbufs, qs.field) = try zml.Buffer.fromBytes(io, platform, qshape, .replicated, mem[eq.offset .. eq.offset + eq.nbytes]);
+        const ws = try std.fmt.bufPrint(&namebuf, "transformer_blocks_{d}_{s}_q8scale", .{ block_idx, qs.stem });
+        const es = try findEntry(blob, ws);
+        const sshape = zml.Shape.init(.{ .o = qs.dims[0], .g = @divExact(qs.dims[1], 128) }, .f32);
+        const sfield = qs.field[0..2] ++ "s";
+        @field(qbufs, sfield) = try zml.Buffer.fromBytes(io, platform, sshape, .replicated, mem[es.offset .. es.offset + es.nbytes]);
+    }
+}
+
 // ---- the pinned host ring -------------------------------------------------
 
 pub const SlotState = enum { free, filling, ready, in_use };
@@ -121,6 +196,10 @@ pub const Ring = struct {
     copy_ns: u64 = 0,
     verify_ns: u64 = 0,
     reader_err: ?anyerror = null,
+    /// Set by abort(): the reader exits at its next wait instead of
+    /// parking forever — without this, an error on the consumer side
+    /// deadlocks the teardown join (found the hard way in walk48 run 1).
+    shutdown: bool = false,
     verified: []bool,
 
     fn assertTransition(from: SlotState, to: SlotState) void {
@@ -173,6 +252,7 @@ pub const Ring = struct {
                 self.mutex.lockUncancelable(io);
                 defer self.mutex.unlock(io);
                 while (true) {
+                    if (self.shutdown) return error.RingShutdown;
                     for (&self.slots) |*s| {
                         if (s.state == .free) break :blk s;
                     }
@@ -221,6 +301,15 @@ pub const Ring = struct {
             self.consumer_parks += 1;
             self.cond.waitUncancelable(io, &self.mutex);
         }
+    }
+
+    /// Consumer-side teardown: wake and retire the reader regardless of
+    /// ring state. Idempotent; call before joining the reader thread.
+    pub fn abort(self: *Ring, io: std.Io) void {
+        self.mutex.lockUncancelable(io);
+        self.shutdown = true;
+        self.mutex.unlock(io);
+        self.cond.broadcast(io);
     }
 
     pub fn release(self: *Ring, io: std.Io, slot: *HostSlot) void {

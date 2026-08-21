@@ -11,6 +11,9 @@ const std = @import("std");
 const zml = @import("zml");
 const blk = @import("block.zig");
 const ldr = @import("loader.zig");
+const buildBlockBufs = ldr.buildBlockBufs;
+const buildQuantBufs = ldr.buildQuantBufs;
+const Q8_SPECS = ldr.Q8_SPECS;
 
 const log = std.log;
 
@@ -44,80 +47,6 @@ fn loadF32(allocator: std.mem.Allocator, io: std.Io, dir: []const u8, name: []co
     const out = try allocator.alloc(f32, expect);
     @memcpy(std.mem.sliceAsBytes(out), raw);
     return out;
-}
-
-/// Normalize a blob entry name to the harness file-stem convention:
-/// '.' -> '_', "::q8scale" -> "_q8scale", "::q8" -> "_q8".
-fn normalizeName(out: []u8, name: []const u8) []const u8 {
-    var n: usize = 0;
-    var i: usize = 0;
-    while (i < name.len) : (i += 1) {
-        if (name[i] == ':' and i + 1 < name.len and name[i + 1] == ':') {
-            out[n] = '_';
-            n += 1;
-            i += 1; // skip the second ':'
-        } else if (name[i] == '.') {
-            out[n] = '_';
-            n += 1;
-        } else {
-            out[n] = name[i];
-            n += 1;
-        }
-    }
-    return out[0..n];
-}
-
-/// Find a blob entry by its normalized harness name.
-fn findEntry(blob: *const ldr.Blob, want: []const u8) !ldr.Entry {
-    var nbuf: [256]u8 = undefined;
-    for (blob.manifest.entries) |e| {
-        if (std.mem.eql(u8, normalizeName(&nbuf, e.name), want)) return e;
-    }
-    log.err("blob {d}: no entry named {s}", .{ blob.manifest.block, want });
-    return error.MissingEntry;
-}
-
-/// Build one block's device buffers from a memory region laid out per the
-/// blob manifest (either a ring slot or the mmap itself for direct mode).
-fn buildBlockBufs(io: std.Io, platform: *zml.Platform, blob: *const ldr.Blob, mem: []const u8, block_idx: i64) !zml.Bufferized(blk.Block) {
-    var bufs: zml.Bufferized(blk.Block) = undefined;
-    var namebuf: [256]u8 = undefined;
-    inline for (blk.WEIGHT_SPECS) |spec| {
-        const stem = comptime spec.file[0 .. spec.file.len - 4]; // drop ".bin"
-        const want = try std.fmt.bufPrint(&namebuf, "transformer_blocks_{d}_{s}", .{ block_idx, stem });
-        const e = try findEntry(blob, want);
-        const data = mem[e.offset .. e.offset + e.nbytes];
-        @field(bufs, spec.field) = try zml.Buffer.fromBytes(io, platform, blk.weightShape(spec), .replicated, data);
-    }
-    return bufs;
-}
-
-const Q8Spec = struct { field: []const u8, stem: []const u8, dims: [2]i64 };
-const Q8_SPECS = [_]Q8Spec{
-    .{ .field = "q1q", .stem = "attn1_to_q_weight", .dims = .{ blk.D, blk.D } },
-    .{ .field = "k1q", .stem = "attn1_to_k_weight", .dims = .{ blk.D, blk.D } },
-    .{ .field = "v1q", .stem = "attn1_to_v_weight", .dims = .{ blk.D, blk.D } },
-    .{ .field = "q2q", .stem = "attn2_to_q_weight", .dims = .{ blk.D, blk.D } },
-    .{ .field = "k2q", .stem = "attn2_to_k_weight", .dims = .{ blk.D, blk.D } },
-    .{ .field = "v2q", .stem = "attn2_to_v_weight", .dims = .{ blk.D, blk.D } },
-    .{ .field = "f1q", .stem = "ff_net_0_proj_weight", .dims = .{ blk.FF, blk.D } },
-    .{ .field = "f2q", .stem = "ff_net_2_weight", .dims = .{ blk.D, blk.FF } },
-};
-
-fn buildQuantBufs(io: std.Io, platform: *zml.Platform, blob: *const ldr.Blob, mem: []const u8, base: zml.Bufferized(blk.Block), qbufs: *zml.Bufferized(blk.QBlock)) !void {
-    qbufs.base = base;
-    var namebuf: [256]u8 = undefined;
-    inline for (Q8_SPECS) |qs| {
-        const wq = try std.fmt.bufPrint(&namebuf, "transformer_blocks_0_{s}_q8", .{qs.stem});
-        const eq = try findEntry(blob, wq);
-        const qshape = zml.Shape.init(.{ .o = qs.dims[0], .i = qs.dims[1] }, .i8);
-        @field(qbufs, qs.field) = try zml.Buffer.fromBytes(io, platform, qshape, .replicated, mem[eq.offset .. eq.offset + eq.nbytes]);
-        const ws = try std.fmt.bufPrint(&namebuf, "transformer_blocks_0_{s}_q8scale", .{qs.stem});
-        const es = try findEntry(blob, ws);
-        const sshape = zml.Shape.init(.{ .o = qs.dims[0], .g = @divExact(qs.dims[1], 128) }, .f32);
-        const sfield = qs.field[0..2] ++ "s";
-        @field(qbufs, sfield) = try zml.Buffer.fromBytes(io, platform, sshape, .replicated, mem[es.offset .. es.offset + es.nbytes]);
-    }
 }
 
 /// One lifecycle pass over `schedule`. slow_ms > 0 sleeps per block to
@@ -258,7 +187,7 @@ pub fn main(init: std.process.Init) !void {
             const slot = try ring_c.acquire(io, pos);
             const blob = &ring_c.blobs[gpu_schedule[pos]];
             ring_bufs[pos] = try buildBlockBufs(io, platform, blob, slot.mem, BLOCK_IDX[pos]);
-            if (pos == 0) try buildQuantBufs(io, platform, blob, slot.mem, ring_bufs[0], &qbufs_ring);
+            if (pos == 0) try buildQuantBufs(io, platform, blob, slot.mem, 0, ring_bufs[0], &qbufs_ring);
             up_bytes += @intCast(blob.manifest.total_bytes);
             ring_c.release(io, slot);
         }
@@ -277,7 +206,7 @@ pub fn main(init: std.process.Init) !void {
     for (0..3) |i| {
         direct_bufs[i] = try buildBlockBufs(io, platform, &blobs[i], blobs[i].data, BLOCK_IDX[i]);
     }
-    try buildQuantBufs(io, platform, &blobs[0], blobs[0].data, direct_bufs[0], &qbufs_direct);
+    try buildQuantBufs(io, platform, &blobs[0], blobs[0].data, 0, direct_bufs[0], &qbufs_direct);
 
     // Bundle inputs (as in block_conformance).
     const x_h = try loadF32(allocator, io, BUNDLE, "in_x.bin", Tu * Du);
