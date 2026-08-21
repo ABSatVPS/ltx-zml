@@ -39,3 +39,14 @@ zig_binary(
     srcs = ["scheduler.zig"],
     visibility = ["//visibility:public"],
 )
+
+# E-STREAM-1/2: streaming loader transfer facts (upload rate, dmaMap,
+# copy/compute overlap), measured before the loader exists.
+zig_binary(
+    name = "stream_smoke",
+    main = "stream_smoke.zig",
+    visibility = ["//visibility:public"],
+    deps = [
+        "//zml",
+    ],
+)

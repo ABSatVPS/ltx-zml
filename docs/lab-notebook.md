@@ -1620,3 +1620,69 @@ startup before any I/O. Measured: steady-state stall per block
 
 Then the loader meets the 48-block assembly, which is the next phase
 checkpoint after these rungs.
+
+## 2026-08-21, later that night — E-STREAM-1/2: the transfer facts, and an overlap illusion that died twice
+
+//ltx:stream_smoke, one block-sized blob (425 MB — the 20 GB int8 DiT
+divided by 48).
+
+E-STREAM-1a, pageable: p50 55.3 ms, **8.06 GB/s**. The upload
+direction does NOT suffer the readback pathology — H2D through
+BufferFromHostBuffer runs sixteen times healthier than the ~0.5 GB/s
+toSliceAlloc D2H we measured three times in runs 3–5. The two
+directions take different code paths in the plugin; never infer one
+from the other.
+
+E-STREAM-1b: PJRT_Client_DmaMap WORKS on the ROCm plugin. The same
+region pinned: p50 31.0 ms, **14.4 GB/s** — 1.78× pageable. The
+hypothesis said "severalfold"; reality says 1.8×. Registered as is.
+
+E-STREAM-2 took three protocols to measure honestly, and the wrong
+turns are the valuable part. Protocol 1 (cold start): compute+upload
+measured FASTER than compute alone, 260 vs 405 ms — impossible, and
+therefore diagnostic: the "alone" batch ran first on a cold,
+unboosted GPU. Clock ramp poisons whichever condition runs first.
+Protocol 2 (warmup plus before/after drift controls): compute alone
+still drifted 297 → 241 ms across batches; the subtraction stayed
+meaningless. Protocol 3 (interleaved A/B — both conditions sample the
+same clock trajectory): compute alone p50 229.1 ms, compute+upload
+273.0 ms, upload alone 31.0 ms. The upload adds ~44 ms — more than
+its own standalone cost. **Zero percent hidden.**
+
+The mechanism, pinned by one more probe: the fromBytes CALL returns
+in 0.0 ms (fully asynchronous at the API — and ZML's exe.call is
+asynchronous too, verified in exe.zig source), but the upload's ready
+event signals only at 272 ms, after the in-flight computation
+finishes. The H2D lands BEHIND the executing kernels on the plugin's
+stream. The serialization is device-side, inside the ROCm PJRT
+plugin — which means a dedicated loader thread would change nothing,
+and upstream's free-overlap-via-enqueue-depth trick does not transfer
+to this backend as-is. The candidate for real overlap, filed for the
+perf pass as E-STREAM-2b: PJRT's CreateBuffersForAsyncHostToDevice
+transfer-manager path (bindings already present in ZML's pjrt.zig),
+which exists precisely to give H2D its own stream.
+
+Decision, per the pre-registered rule: serial pinned uploads cost
+48 × 31 ms ≈ 1.5 s per denoising step against today's ~60 s/step
+compute — 2.5%, invisible. The loader proceeds with SERIAL pinned
+uploads and the ring state machine unchanged; overlap is a perf-pass
+item with a named API, not a Phase 3 blocker. (If attention gets its
+hoped-for order of magnitude someday, 1.5 s/step becomes material —
+that is exactly when E-STREAM-2b runs.)
+
+Two free findings. First: the 128-long dependent GEMM chain sustained
+**~77 TFLOP/s** (17.6 TFLOP in 229 ms) — comfortably above E1's 59
+for a single dispatch. Chained same-shape GEMMs amortize launch and
+autotune overheads; good news for the DiT's dense stretches. (The
+chain's scalar sum underflows to zero in f16 at these magnitudes —
+expected, and irrelevant: the timing, not the value, is the
+evidence.) Second, a methodology entry for the growing list: GPU A/B
+timing must INTERLEAVE its conditions. This is the third time the
+measurement itself was the bug — readback poison in runs 3–5,
+cross-executable autotuning in the E3w agreement gate, and now clock
+ramp. The instruments keep being the experiment.
+
+E-STREAM-1 and -2 are answered. Remaining before assembly:
+E-STREAM-3 — the ring itself (three device slots, two pinned host
+slots, mmap reader, lifecycle asserts, startup static-cycle check)
+plus the one-blob-per-block pack step in tooling.
