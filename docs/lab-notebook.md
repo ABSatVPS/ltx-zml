@@ -706,3 +706,49 @@ The genesis entry's last "to verify" item is now closed. Milestone 5
 an exact blueprint: patchify 128→4096, 48× [gated self-attn with 3D
 RoPE + gated cross-attn against connector output + bias-free 4× GELU
 FFN, AdaLN-modulated], with the audio stream and bridges alongside.
+
+## 2026-08-21 — Phase 1 opens: E4 hypotheses, and the Conv VAE's real ladder
+
+Same order as always: shapes from the source, hypotheses on paper,
+then the benchmark. A 170-tensor header fetch on
+`vae/ltx-2.5-video-vae-conv-bf16.safetensors` (726 M params total)
+gives the decoder exactly: conv_in 128→1024, then five stages of
+3×3×3 residual convs — 2 blocks at 1024 ch (latent scale), 2 at 512
+after a 2×2×2 pixel-shuffle upsample, 4 more at 512 after a second
+2×2×2, 6 at 256 after a temporal-only ×2, 4 at 128 after a 2×2
+spatial — closing with a 48-channel conv that unshuffles to RGB × 4×4.
+Spatial 2·2·2·4 = 32×, temporal 2·2·2 = 8×: the documented compression,
+now accounted for stage by stage. Roughly 2–4 GFLOP of convolution per
+latent voxel end to end, so a 10 s 1216×704 clip (≈26 k voxels) costs
+on the order of 78 TFLOP to decode.
+
+**E4 hypotheses, pre-registered:**
+
+First, the lowering: XLA on ROCm will send these convs to a library
+custom call (the conv analogue of the cublas→hipBLASLt routing E1a
+found) — if instead the dump shows a native loop emitter, throughput
+craters and that finding restructures Phase 5. The dump arbitrates.
+
+Second, throughput: a 3×3×3 conv at C≥256 carries 27·C MACs per output
+element — GEMM-class arithmetic intensity — so if the library path is
+real, the wide stages should land in the tens of TFLOP/s and the
+128-channel stage may lean bandwidth-bound. Under those numbers the
+whole decode is seconds per clip, and the conclusion would be that
+**the VAE is not the bottleneck** — attention holds that title —
+making Phase 5's real risk memory and seams, not speed.
+
+Third, memory: a latent tile of 8×16×16 keeps the largest activation
+(128 ch at 64×128×128) around 270 MB and the whole tile pipeline under
+~1.5 GB — comfortable next to resident DiT weights. The benchmark
+sweeps the four workhorse shapes at that tile size.
+
+Notes for honesty: the benchmark runs f16 rather than bf16 (RDNA 4
+rates them identically and Zig has no native bf16 host type — noted,
+not hidden), and it uses symmetric SAME padding where the real decoder
+is temporally causal — identical arithmetic, different edge semantics,
+irrelevant to throughput. Seam handling (the receptive-field halo is
+several latent voxels per side by the deepest stage; overlap-vs-blend
+is a real trade at tile 16×16) is deliberately deferred to Phase 5
+design, as the roadmap says. ZML needs no patch for any of this: its
+`convolution` is generically N-dimensional; conv1d/conv2d are wrappers,
+and a third spatial dimension is just longer arrays.

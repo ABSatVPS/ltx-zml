@@ -1,10 +1,20 @@
 load("@rules_zig//zig:defs.bzl", "zig_binary")
 
-# E1..E4 smoke benchmarks: the compiler-behavior unknowns, measured before
+# E1..E3 smoke benchmarks: the compiler-behavior unknowns, measured before
 # any engine code exists. See docs/lab-notebook.md for the hypotheses.
 zig_binary(
     name = "smoke",
     main = "smoke.zig",
+    visibility = ["//visibility:public"],
+    deps = [
+        "//zml",
+    ],
+)
+
+# E4: 3D convolution at the LTX-2.5 Conv VAE decoder's real shapes.
+zig_binary(
+    name = "vae_smoke",
+    main = "vae_smoke.zig",
     visibility = ["//visibility:public"],
     deps = [
         "//zml",
