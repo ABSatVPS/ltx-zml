@@ -110,11 +110,17 @@ def main() -> int:
     identity_ops = TransformerOpsConfig.from_functions(gated_attention=lambda x, out, mod: out)
     blk_nogate = build(identity_ops)
 
-    # ---- inputs (f64, seeded) --------------------------------------------
-    x = (torch.randn(B, T, DIM, dtype=torch.float64) * 0.5)
-    context = (torch.randn(B, S, DIM, dtype=torch.float64) * 0.5)
-    timestep = (torch.randn(B, T, 9 * DIM, dtype=torch.float64) * 0.1)
-    prompt_timestep = (torch.randn(B, 1, 2 * DIM, dtype=torch.float64) * 0.1)
+    # ---- inputs (seeded; ROUNDED THROUGH F32 so the serialized f32 bytes
+    # are exactly the values the oracle computes on — otherwise consumers
+    # of the bundle see f32-rounded inputs the oracle never used, which
+    # showed up as a 1.5e-5 phantom when chaining blocks) -------------------
+    def f32_exact(t: torch.Tensor) -> torch.Tensor:
+        return t.to(torch.float32).to(torch.float64)
+
+    x = f32_exact(torch.randn(B, T, DIM, dtype=torch.float64) * 0.5)
+    context = f32_exact(torch.randn(B, S, DIM, dtype=torch.float64) * 0.5)
+    timestep = f32_exact(torch.randn(B, T, 9 * DIM, dtype=torch.float64) * 0.1)
+    prompt_timestep = f32_exact(torch.randn(B, 1, 2 * DIM, dtype=torch.float64) * 0.1)
     grid = make_grid()
 
     # ---- RoPE tables: f64 numpy path, single cast to f32 (the contract) --

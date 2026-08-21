@@ -1021,3 +1021,35 @@ clip is judged. Every run record freezes the oracle bundle hash,
 model revision, RoPE metadata, and compiler/runtime versions.
 
 Blocks 23 and 47 are fetching as this is written.
+
+## 2026-08-21, late night — Phase 3 checkpoint 1: the 0/23/47 chain conforms
+
+Two defects between plan and pass, both instructive. First, the chain
+oracle's exactness assertion caught a serialization phantom: the
+parent bundle computed on f64 inputs BEFORE their f32 serialization,
+so every bundle consumer — the Zig side included, all along — saw
+inputs the oracle never exactly used, worth a ~1.5e-5 phantom at chain
+boundaries. Inputs are now rounded through f32 at generation, making
+the serialized bytes the exact contract; chain_b0_out then equals the
+parent block_out to the bit. That is the second time in one day an
+exactness assertion converted a would-be debugging afternoon into one
+edit — a tolerance check would have absorbed the phantom silently and
+let it masquerade as accumulating compute error across 48 blocks.
+Second, Zig's comptime reflection over the nested three-block struct
+(84 tensor fields) exceeded the default evaluation quota — one
+@setEvalBranchQuota, noted for when the 48-block struct multiplies
+that by sixteen.
+
+The result: with real weights for blocks 0, 23, and 47 (early, middle,
+late) chained under shared timestep/context/RoPE per LTXModel
+semantics, boundary gates read **chainB23 rel-RMS 2.43e-6 and
+chainB47 2.74e-6** against the f64 oracle — sub-linear error growth
+(1.84 → 2.43 → 2.74e-6 across one, two, three blocks), extrapolating
+to roughly 1e-5 across all 48. Activation magnitudes grow modestly
+(253 → 495 → 717 max-abs under random modulation). Cross-block
+composition — risk #2 in the pre-registered Phase 3 order — is clean
+in f32. All twelve single-block gates re-passed unchanged on the
+regenerated bundle.
+
+Next per the pre-registered ladder: int4, one projection family at a
+time, compared against this f32 chain by projection class.

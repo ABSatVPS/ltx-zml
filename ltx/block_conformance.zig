@@ -33,7 +33,10 @@ const MAXPOS = [3]f64{ 20, 2048, 2048 };
 const THETA: f64 = 10000.0;
 
 const BUNDLE = "/home/adam/Development/Experiments/Video-Generation/.work/oracle_bundle";
+const CHAIN_BUNDLE = "/home/adam/Development/Experiments/Video-Generation/.work/chain_bundle";
 const WEIGHTS = "/home/adam/Development/Experiments/Video-Generation/.work/block0";
+const WEIGHTS23 = "/home/adam/Development/Experiments/Video-Generation/.work/block23";
+const WEIGHTS47 = "/home/adam/Development/Experiments/Video-Generation/.work/block47";
 
 // ---- host I/O -------------------------------------------------------------
 
@@ -367,34 +370,34 @@ const WSpec = struct {
 };
 
 const WEIGHT_SPECS = [_]WSpec{
-    .{ .field = "q1_w", .file = "transformer_blocks_0_attn1_to_q_weight.bin", .dims = &.{ D, D } },
-    .{ .field = "q1_b", .file = "transformer_blocks_0_attn1_to_q_bias.bin", .dims = &.{D} },
-    .{ .field = "k1_w", .file = "transformer_blocks_0_attn1_to_k_weight.bin", .dims = &.{ D, D } },
-    .{ .field = "k1_b", .file = "transformer_blocks_0_attn1_to_k_bias.bin", .dims = &.{D} },
-    .{ .field = "v1_w", .file = "transformer_blocks_0_attn1_to_v_weight.bin", .dims = &.{ D, D } },
-    .{ .field = "v1_b", .file = "transformer_blocks_0_attn1_to_v_bias.bin", .dims = &.{D} },
-    .{ .field = "o1_w", .file = "transformer_blocks_0_attn1_to_out_0_weight.bin", .dims = &.{ D, D } },
-    .{ .field = "o1_b", .file = "transformer_blocks_0_attn1_to_out_0_bias.bin", .dims = &.{D} },
-    .{ .field = "qn1", .file = "transformer_blocks_0_attn1_q_norm_weight.bin", .dims = &.{D} },
-    .{ .field = "kn1", .file = "transformer_blocks_0_attn1_k_norm_weight.bin", .dims = &.{D} },
-    .{ .field = "g1_w", .file = "transformer_blocks_0_attn1_to_gate_logits_weight.bin", .dims = &.{ H, D } },
-    .{ .field = "g1_b", .file = "transformer_blocks_0_attn1_to_gate_logits_bias.bin", .dims = &.{H} },
-    .{ .field = "q2_w", .file = "transformer_blocks_0_attn2_to_q_weight.bin", .dims = &.{ D, D } },
-    .{ .field = "q2_b", .file = "transformer_blocks_0_attn2_to_q_bias.bin", .dims = &.{D} },
-    .{ .field = "k2_w", .file = "transformer_blocks_0_attn2_to_k_weight.bin", .dims = &.{ D, D } },
-    .{ .field = "k2_b", .file = "transformer_blocks_0_attn2_to_k_bias.bin", .dims = &.{D} },
-    .{ .field = "v2_w", .file = "transformer_blocks_0_attn2_to_v_weight.bin", .dims = &.{ D, D } },
-    .{ .field = "v2_b", .file = "transformer_blocks_0_attn2_to_v_bias.bin", .dims = &.{D} },
-    .{ .field = "o2_w", .file = "transformer_blocks_0_attn2_to_out_0_weight.bin", .dims = &.{ D, D } },
-    .{ .field = "o2_b", .file = "transformer_blocks_0_attn2_to_out_0_bias.bin", .dims = &.{D} },
-    .{ .field = "qn2", .file = "transformer_blocks_0_attn2_q_norm_weight.bin", .dims = &.{D} },
-    .{ .field = "kn2", .file = "transformer_blocks_0_attn2_k_norm_weight.bin", .dims = &.{D} },
-    .{ .field = "g2_w", .file = "transformer_blocks_0_attn2_to_gate_logits_weight.bin", .dims = &.{ H, D } },
-    .{ .field = "g2_b", .file = "transformer_blocks_0_attn2_to_gate_logits_bias.bin", .dims = &.{H} },
-    .{ .field = "ff1_w", .file = "transformer_blocks_0_ff_net_0_proj_weight.bin", .dims = &.{ FF, D } },
-    .{ .field = "ff2_w", .file = "transformer_blocks_0_ff_net_2_weight.bin", .dims = &.{ D, FF } },
-    .{ .field = "sst", .file = "transformer_blocks_0_scale_shift_table.bin", .dims = &.{ 9, D }, .f32_ = true },
-    .{ .field = "psst", .file = "transformer_blocks_0_prompt_scale_shift_table.bin", .dims = &.{ 2, D }, .f32_ = true },
+    .{ .field = "q1_w", .file = "attn1_to_q_weight.bin", .dims = &.{ D, D } },
+    .{ .field = "q1_b", .file = "attn1_to_q_bias.bin", .dims = &.{D} },
+    .{ .field = "k1_w", .file = "attn1_to_k_weight.bin", .dims = &.{ D, D } },
+    .{ .field = "k1_b", .file = "attn1_to_k_bias.bin", .dims = &.{D} },
+    .{ .field = "v1_w", .file = "attn1_to_v_weight.bin", .dims = &.{ D, D } },
+    .{ .field = "v1_b", .file = "attn1_to_v_bias.bin", .dims = &.{D} },
+    .{ .field = "o1_w", .file = "attn1_to_out_0_weight.bin", .dims = &.{ D, D } },
+    .{ .field = "o1_b", .file = "attn1_to_out_0_bias.bin", .dims = &.{D} },
+    .{ .field = "qn1", .file = "attn1_q_norm_weight.bin", .dims = &.{D} },
+    .{ .field = "kn1", .file = "attn1_k_norm_weight.bin", .dims = &.{D} },
+    .{ .field = "g1_w", .file = "attn1_to_gate_logits_weight.bin", .dims = &.{ H, D } },
+    .{ .field = "g1_b", .file = "attn1_to_gate_logits_bias.bin", .dims = &.{H} },
+    .{ .field = "q2_w", .file = "attn2_to_q_weight.bin", .dims = &.{ D, D } },
+    .{ .field = "q2_b", .file = "attn2_to_q_bias.bin", .dims = &.{D} },
+    .{ .field = "k2_w", .file = "attn2_to_k_weight.bin", .dims = &.{ D, D } },
+    .{ .field = "k2_b", .file = "attn2_to_k_bias.bin", .dims = &.{D} },
+    .{ .field = "v2_w", .file = "attn2_to_v_weight.bin", .dims = &.{ D, D } },
+    .{ .field = "v2_b", .file = "attn2_to_v_bias.bin", .dims = &.{D} },
+    .{ .field = "o2_w", .file = "attn2_to_out_0_weight.bin", .dims = &.{ D, D } },
+    .{ .field = "o2_b", .file = "attn2_to_out_0_bias.bin", .dims = &.{D} },
+    .{ .field = "qn2", .file = "attn2_q_norm_weight.bin", .dims = &.{D} },
+    .{ .field = "kn2", .file = "attn2_k_norm_weight.bin", .dims = &.{D} },
+    .{ .field = "g2_w", .file = "attn2_to_gate_logits_weight.bin", .dims = &.{ H, D } },
+    .{ .field = "g2_b", .file = "attn2_to_gate_logits_bias.bin", .dims = &.{H} },
+    .{ .field = "ff1_w", .file = "ff_net_0_proj_weight.bin", .dims = &.{ FF, D } },
+    .{ .field = "ff2_w", .file = "ff_net_2_weight.bin", .dims = &.{ D, FF } },
+    .{ .field = "sst", .file = "scale_shift_table.bin", .dims = &.{ 9, D }, .f32_ = true },
+    .{ .field = "psst", .file = "prompt_scale_shift_table.bin", .dims = &.{ 2, D }, .f32_ = true },
 };
 
 fn weightShape(spec: WSpec) zml.Shape {
@@ -411,6 +414,45 @@ fn weightShape(spec: WSpec) zml.Shape {
         else => unreachable,
     };
 }
+
+/// Fresh tracer spec tensors for one block. MUST be called once per block
+/// instance in a multi-block model: reusing one spec set across chain
+/// fields would trip the tracer's duplicate-argument check (run 1 lesson).
+fn makeBlockSpecs() Block {
+    var m: Block = undefined;
+    inline for (WEIGHT_SPECS) |spec| {
+        @field(m, spec.field) = zml.Tensor.fromShape(weightShape(spec));
+    }
+    return m;
+}
+
+fn loadBlockBufs(allocator: std.mem.Allocator, io: std.Io, platform: *zml.Platform, dir: []const u8, block_idx: i64) !zml.Bufferized(Block) {
+    var bufs: zml.Bufferized(Block) = undefined;
+    inline for (WEIGHT_SPECS) |spec| {
+        var namebuf: [256]u8 = undefined;
+        const fname = try std.fmt.bufPrint(&namebuf, "transformer_blocks_{d}_{s}", .{ block_idx, spec.file });
+        const raw = try readBin(allocator, io, dir, fname);
+        defer allocator.free(raw);
+        @field(bufs, spec.field) = try zml.Buffer.fromBytes(io, platform, weightShape(spec), .replicated, raw);
+    }
+    return bufs;
+}
+
+/// Phase 3 checkpoint 1: blocks 0, 23, 47 chained, boundary-gated. Shared
+/// timestep/context/pe per LTXModel semantics; only x flows.
+const Chain = struct {
+    b0: Block,
+    b23: Block,
+    b47: Block,
+
+    pub fn chainB23(self: @This(), x: zml.Tensor, ts3: zml.Tensor, ctx: zml.Tensor, pts2: zml.Tensor, cos: zml.Tensor, sin: zml.Tensor) zml.Tensor {
+        return self.b23.blockOut(self.b0.blockOut(x, ts3, ctx, pts2, cos, sin), ts3, ctx, pts2, cos, sin);
+    }
+
+    pub fn chainB47(self: @This(), x: zml.Tensor, ts3: zml.Tensor, ctx: zml.Tensor, pts2: zml.Tensor, cos: zml.Tensor, sin: zml.Tensor) zml.Tensor {
+        return self.b47.blockOut(self.chainB23(x, ts3, ctx, pts2, cos, sin), ts3, ctx, pts2, cos, sin);
+    }
+};
 
 // ---- comparison ------------------------------------------------------------
 
@@ -451,6 +493,9 @@ fn compare(name: []const u8, got: []const f32, want: []const f32, limit: f64) bo
 // ---- main ------------------------------------------------------------------
 
 pub fn main(init: std.process.Init) !void {
+    // The nested Chain struct (3 x 28 tensors) pushes comptime reflection
+    // past the default 1000-branch quota.
+    @setEvalBranchQuota(1_000_000);
     const allocator = init.gpa;
     const io = init.io;
 
@@ -470,17 +515,9 @@ pub fn main(init: std.process.Init) !void {
     const Hu: usize = @intCast(H);
 
     // ---- weights to device ----
-    var model: Block = undefined;
-    var bufs: zml.Bufferized(Block) = undefined;
-    inline for (WEIGHT_SPECS) |spec| {
-        const raw = try readBin(allocator, io, WEIGHTS, spec.file);
-        defer allocator.free(raw);
-        const shape = weightShape(spec);
-        const buf: zml.Buffer = try .fromBytes(io, platform, shape, .replicated, raw);
-        @field(bufs, spec.field) = buf;
-        @field(model, spec.field) = zml.Tensor.fromShape(shape);
-    }
-    log.info("28 weight tensors resident", .{});
+    const model = makeBlockSpecs();
+    const bufs = try loadBlockBufs(allocator, io, platform, WEIGHTS, 0);
+    log.info("block 0: 28 weight tensors resident", .{});
 
     // ---- bundle inputs ----
     const x_h = try loadF32(allocator, io, BUNDLE, "in_x.bin", Tu * Du);
@@ -582,8 +619,38 @@ pub fn main(init: std.process.Init) !void {
         if (!compare(st.method, got, want, 2e-3)) all_pass = false;
     }
 
+    // ---- Phase 3 checkpoint 1: the 0/23/47 chain --------------------------
+    const b23_bufs = try loadBlockBufs(allocator, io, platform, WEIGHTS23, 23);
+    const b47_bufs = try loadBlockBufs(allocator, io, platform, WEIGHTS47, 47);
+    log.info("blocks 23 and 47 resident", .{});
+    const chain_model: Chain = .{ .b0 = makeBlockSpecs(), .b23 = makeBlockSpecs(), .b47 = makeBlockSpecs() };
+    const cbufs: zml.Bufferized(Chain) = .{ .b0 = bufs, .b23 = b23_bufs, .b47 = b47_bufs };
+
+    const chain_stages = [_]struct { method: []const u8, oracle: []const u8 }{
+        .{ .method = "chainB23", .oracle = "chain_b23_out.bin" },
+        .{ .method = "chainB47", .oracle = "chain_b47_out.bin" },
+    };
+    inline for (chain_stages) |st| {
+        const method = comptime std.meta.stringToEnum(std.meta.DeclEnum(Chain), st.method).?;
+        var exe = try platform.compile(allocator, io, chain_model, method, .{ x_spec, ts_spec, ctx_spec, pts_spec, cos_spec, sin_spec }, .{});
+        var args = try exe.args(allocator);
+        defer args.deinit(allocator);
+        var results = try exe.results(allocator);
+        defer results.deinit(allocator);
+        args.set(.{ cbufs, x_buf, ts_buf, ctx_buf, pts_buf, cos_buf, sin_buf });
+        exe.call(args, &results);
+        var out: zml.Buffer = results.get(zml.Buffer);
+        defer out.deinit();
+        var slice = try out.toSliceAlloc(allocator, io);
+        defer slice.free(allocator);
+        @memcpy(got, slice.constItems(f32)[0..out_len]);
+        const want = try loadF32(allocator, io, CHAIN_BUNDLE, st.oracle, out_len);
+        defer allocator.free(want);
+        if (!compare(st.method, got, want, 2e-3)) all_pass = false;
+    }
+
     if (all_pass) {
-        log.info("BLOCK CONFORMANCE: ALL GATES PASS", .{});
+        log.info("BLOCK CONFORMANCE: ALL GATES PASS (single block + 0/23/47 chain)", .{});
     } else {
         log.err("BLOCK CONFORMANCE: FAILURES ABOVE", .{});
         return error.ConformanceFailed;
