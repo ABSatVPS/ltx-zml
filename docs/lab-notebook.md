@@ -2332,3 +2332,35 @@ predicts ~1.4-1.7 s/block, ~70-85 s for 48 blocks; staging 25.8 GB at
 ~430 MB/s is ~60 s and for the FIRST time should hide entirely
 behind compute — reader parks near zero is the tell. Core parts add
 ~1 s (the ts9 GEMM is 8.7 TFLOP). Predicted step wall: 75-120 s.
+
+### H-LOOP results: the engine walks the reference trajectory, 8/8 steps
+
+The oracle finished all 8 f64 forwards in ~35 minutes (~103 s per
+forward — the 13-min-per-forward estimate from the e2e bundle's wall
+clock was wrong because that wall clock was mostly BLOCK LOADING from
+a cold page cache; with the blobs hot, the f64 compute itself is
+fast). Engine run, //ltx:e2e_denoise:
+
+CONTROL noised x0: BITWISE match. Every per-step host timesteps
+vector: BITWISE match (no assert fired). Velocities: 1.006e-5,
+1.517e-5, 3.452e-5, 2.648e-5, 1.180e-5, 1.600e-5, 1.784e-5, 2.200e-5
+— all PASS, all better than the ~1e-4 expectation. Latents vs the
+reference trajectory: 5.085e-8 → 9.110e-8 → 1.736e-7 → 2.084e-7 →
+6.077e-7 → 3.309e-6 → 6.997e-6 → 1.004e-5 — all PASS, final drift
+200x under the 2e-3 budget. ~68 s/step wall at T=64,
+staging-dominated as at the single pass.
+
+The error-attribution story is exactly what the design bought: with
+the initial latent and every conditioning vector bitwise-identical
+and the scheduler arithmetic bit-exact on both sides, ALL trajectory
+drift is velocity-sourced. And the drift shape confirms it — early
+steps have tiny dt (0.00625), so 1e-5 velocity error moves the latent
+by ~1e-7; the late steps' large dt (up to 0.42) do the accumulating.
+Compounding is benign: 8 steps of ~2e-5 velocity noise sum to 1e-5 of
+latent, sub-linear in the pessimistic estimate.
+
+**"Latents match the reference pipeline's within tolerance, step by
+step" is CLOSED at harness T.** What remains of Phase 3's done-means
+is exactly one clause: the pass at production length, fits + runs +
+time-per-step. //ltx:e2e_prod is compiled and pre-registered; running
+it next on the now-quiet machine.
