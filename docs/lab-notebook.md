@@ -798,3 +798,66 @@ that forces it recorded.
 **Phase 1 complete.** E1 through E4 are all answered. Next: Phase 2 —
 one checkpoint-exact transformer block against the reference, using
 range-requested block-0 weights.
+
+## 2026-08-21, evening — Phase 2 spec: the reference forward, read line by line
+
+Before writing a line of block code, the reference (`ltx-core`
+transformer sources, read in full) answered every ambiguity — including
+five that could not have been guessed. Recorded here so the oracle
+diffs, when they come, are diagnosable.
+
+**The block wiring, exactly.** All AdaLN values are PER-TOKEN (the
+timestep embedding carries a token dimension — causal conditioning
+means tokens can sit at different noise levels), computed as the
+per-block table plus the embedding, chunk order (shift, scale, gate):
+slots 0–2 self-attention, 3–5 feed-forward, 6–8 cross-attention
+query-side. Sequence: modulated-RMS → gated self-attention → residual
+add with gate_msa, then a FRESH un-weighted RMS of the residual which
+feeds cross-attention (which does NOT re-normalize); cross-attention
+applies its own query modulation, K/V get the 2-row prompt table plus
+the prompt-timestep embedding, output is gated and residual-added;
+feed-forward last with its own modulation and gate. Block RMS norms
+carry no learned weight (norm_elementwise_affine=false); the qk norms
+DO carry weights and act on the FULL 4096-dim projection, not
+per-head. Norm precedes RoPE. Cross-attention has no RoPE at all.
+
+**Gates:** logits from the attention's own (modulated) input, one per
+head, and the gate is **2·sigmoid(logit)** — the factor of 2 is the
+kind of detail a re-implementation from the paper would never contain.
+Gating multiplies the per-head outputs BEFORE the output projection.
+
+**RoPE, the five surprises.** (1) The frequency grid is
+theta^linspace(0, 1, dim/6) · π/2 — increasing from π/2 to θπ/2, not
+the classic inverse-power ladder. (2) Positions are FRACTIONAL:
+pos/max_pos mapped to [-1, 1]. (3) The per-axis products are laid out
+freq-major with (t, x, y) triplets adjacent, giving 3·682 = 2046
+values — then **front-padded with 2 identity slots** (cos 1, sin 0) to
+reach dim/2 = 2048. (4) Those 2048 slots are then SPLIT ACROSS THE 32
+HEADS — head 0 gets the padding and lowest frequencies, head 31 the
+highest; heads are not interchangeable. (5) Rotation pairs are
+(i, i+64) within each head's 128 dims — split-half, not interleaved —
+and table generation follows the numpy float64 path
+(frequencies_precision = float64 in the checkpoint).
+
+**Pass criteria, pre-registered before any diff exists:**
+RoPE cos/sin tables must match the f64 reference to the last ulp after
+the cast to f32 — anything worse means the grid formula is wrong, and
+nothing downstream is diagnosable until it's exact. Individual
+components (qk-norm, gate path, FFN) on real bf16 weights: relative
+RMS ≤ 2e-3 against an f64-accumulated reference. The full block
+output: relative RMS ≤ 1e-2, with the honest expectation of ~3e-3 —
+if it needs the full budget, that is itself a finding to chase, not a
+pass to celebrate. Weight pull verification happens BEFORE any forward
+pass: per-tensor SHA-256 over the ranged bytes, shape/dtype checked
+against the header, and first/last elements printed and compared with
+the reference loader's view of the same tensors.
+
+**Composition order for the oracle runs**, so the first mismatch
+localizes itself: tables alone → attention with gates forced to
+identity → gates on → feed-forward → AdaLN modulation → full block.
+The 32/32 discipline works because each check is small.
+
+Build plan: `tools/fetch_block.py` (range-request block 0 + shared
+tables by header offsets, ~600 MB, checksummed), a torch-CPU
+reference venv that runs the upstream block and dumps input/output
+test vectors, then the ZML block and `//ltx:block_conformance`.
