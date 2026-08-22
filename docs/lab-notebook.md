@@ -2550,3 +2550,26 @@ compile ~54 s once; conditioning + patchify ~1.5 s; block 0 ~10 s
 recorded when the gather run's readback closes the loop. The capped
 systemd-run discipline held: MemoryPeak pinned at exactly the 9 GiB
 cap with the desktop untouched across four consecutive runs.
+
+### Addendum before the gather build: an off-the-shelf anchor, and the go
+
+Adam's research adds an external reference point: a content-creator
+benchmark (youtube.com/@smartvisionwilliam) reports off-the-shelf
+LTX 2.5 on an 8 GB GPU / 32 GB RAM machine at ~13 minutes per
+~5-second clip, dominated by RAM/disk spill — standard runtimes
+lack the memory governance to keep the working set resident.
+Logged as ANECDOTE, not baseline: different hardware class, and
+their figure includes the full pipeline (text encoding, VAE) at
+unknown settings. Its value here is directional: the entire premise
+of this engine — static executables, streamed weights, everything
+gated to fit — is that the working set never spills, and our
+measured ~1.3 s/block puts the denoising pass at ~75-90 s/step by
+construction rather than by luck. The honest comparison lands in
+Phase 6 against the reference pipeline on THIS machine.
+
+Build proceeds on the ts9-gather pre-registration above, one added
+expectation made explicit: at K=T with an identity index the
+gathered values are elementwise identical to the sliced values, so
+the re-fenced suites (22 block gates, walk48, e2e_walk,
+e2e_denoise) are expected at their HISTORICAL numbers — any drift
+is a bug in the refactor, not noise to re-budget.
