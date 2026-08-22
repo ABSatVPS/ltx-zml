@@ -2643,3 +2643,26 @@ once the gather fusion recovers — against the ~13 min/clip
 off-the-shelf anecdote on lesser hardware, with our VAE and prompt
 path still to come. The remaining phases inherit an engine whose
 every layer has an oracle, a fence, and a receipt.
+
+## 2026-08-22 — Phase 6 opens: the gather fusion chase, pre-registered
+
+Adam's call, and the right one: chase the 4-5x block regression NOW,
+while the delta between the pre-gather and post-gather graphs is one
+surgical change — Phase 4 would only add nodes to the diff. The
+pre-gather reference exists (run 8's dump, module_0239: the chunk-1024
+block with resident ts9, 1.3 s/block, temp arena 9,426,703,416 B).
+The build: dump the post-gather block's after-optimization HLO +
+buffer assignment + autotune results, and diff.
+
+TWO hypotheses, ranked, pre-registered before looking:
+H-FUSE-1 (the assumed one): the nine gathered modulation tensors
+materialize as standalone kernels instead of fusing into their
+consumers, and fusion boundaries shifted through the graph — the
+diff shows more fusions/materialized [28672,4096] temps around the
+adaVal sites. H-FUSE-2 (the sleeper): the regression has NOTHING to
+do with gather fusion — changing the module changed its cache hash,
+autotuning re-ran fresh, and hipBLASLt picked worse algorithms for
+the SAME GEMMs; the diff shows autotune_results diverging on the
+big dots while fusion structure stays comparable. The fixes differ
+completely (graph surgery vs pinning the autotune cache), which is
+why the diff comes before any code.
