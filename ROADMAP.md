@@ -59,7 +59,7 @@ revision-pinned range-request weight fetcher, torch-CPU oracle bundle
 generator with staged dumps verified identical to the reference
 forward, and `//ltx:block_conformance`.
 
-## Phase 3 — Full video-stream DiT — IN PROGRESS
+## Phase 3 — Full video-stream DiT — COMPLETE
 
 All 48 blocks at int8-g128 (~20 GB, streamed through the block-prefetch
 pipeline — the int4-residency plan died on the model's outlier-heavy
@@ -98,11 +98,24 @@ forward — patchify → adaln-driven 48 streamed blocks → tail, all on
 device — matches a full-forward f64 oracle at 8.4e-5; and the
 bit-exact scheduler driving the engine through stage 1's full
 8-step distilled trajectory reproduces the reference latents at
-every step (final drift 1.0e-5, 200x under budget, all of it
-velocity-sourced — the scheduler seam is bitwise). Block geometry is
-now trace-time-parametrized (22 gates bitwise-stable). Remaining:
-the production-length clause — fits + runs + time-per-step at
-T≈28k under the E3w kernel (//ltx:e2e_prod, pre-registered).
+every step (final drift 1.1e-5, all of it velocity-sourced — the
+scheduler seam is bitwise). Block geometry is trace-time-
+parametrized and the per-token conditioning is a K-row gathered
+table (22 gates stable through both refactors).
+
+PRODUCTION LENGTH CLOSED (2026-08-22): the full velocity pass runs
+end to end at T=28,672 — E3w while attention at its measured chunk
+(1024; the harness chunk was a 20x trap, receipts in the notebook),
+ring-streamed weights, K=3 gathered conditioning, finite velocity
+read back with five-way cross-configuration byte-consistency —
+inside hard resource caps that keep the desktop alive (the earlier
+"crashes" were this experiment starving the compositor; kernel-log
+receipts). Time-per-step recorded: 309.8 s as landed; the known
+recovery target is ~65 s/pass (1.3 s/block pre-gather), filed as
+Phase 6's opening item (gather fusion). The notebook carries the
+full OOM-chase arc: a first-call arena allocation that could never
+fit beside a resident f32 ts9, whose failed attempt wedged the
+transfer stream — resolved structurally by the gather.
 
 Done means: latents for a fixed seed and fixed precomputed conditioning
 match the reference pipeline's within tolerance, step by step, and a
