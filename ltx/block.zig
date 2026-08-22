@@ -46,7 +46,23 @@ pub fn modulate(n: zml.Tensor, scale: zml.Tensor, shift: zml.Tensor) zml.Tensor 
 /// T=28,672: it is why block 0's arena never fit on the first attempt).
 pub fn adaVal(table: zml.Tensor, tstab: zml.Tensor, tidx: zml.Tensor, i: i64) zml.Tensor {
     const row = table.convert(.f32).slice1d(.n, .{ .start = i, .end = i + 1 }).squeeze(.n); // [.i]
-    const tv = tstab.slice1d(.n, .{ .start = i, .end = i + 1 }).squeeze(.n).gather(.{ .k = tidx }, .{}); // [.t,.i]
+    // Row selection as a trace-time SELECT-CHAIN over the K rows rather
+    // than a gather op: the HLO diff acquitted both fusion structure and
+    // autotuning of the 4-5x block regression (notebook 2026-08-22), and
+    // the 9 standalone gather kernels writing 470 MB each are the last
+    // suspect — a select-chain is pure fused elementwise (2 selects at
+    // production K=3) and BIT-EXACT (select copies bits; a one-hot
+    // matmul could flip -0.0).
+    const chunk = tstab.slice1d(.n, .{ .start = i, .end = i + 1 }).squeeze(.n); // [.k,.i]
+    const kk = chunk.dim(.k);
+    const out_shape = zml.Shape.init(.{ .t = tidx.dim(.t), .i = chunk.dim(.i) }, .f32);
+    var tv = chunk.slice1d(.k, .{ .start = 0, .end = 1 }).squeeze(.k).broad(out_shape); // row 0 everywhere
+    var k: i64 = 1;
+    while (k < kk) : (k += 1) {
+        const is_k = tidx.cmp(.EQ, zml.Tensor.scalar(k, .i32).broad(tidx.shape())).broad(out_shape);
+        const row_k = chunk.slice1d(.k, .{ .start = k, .end = k + 1 }).squeeze(.k).broad(out_shape);
+        tv = is_k.select(row_k, tv);
+    }
     return tv.add(row.broad(tv.shape()));
 }
 

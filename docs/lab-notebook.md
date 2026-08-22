@@ -2666,3 +2666,46 @@ the SAME GEMMs; the diff shows autotune_results diverging on the
 big dots while fusion structure stays comparable. The fixes differ
 completely (graph surgery vs pinning the autotune cache), which is
 why the diff comes before any code.
+
+### The fusion chase ends in an acquittal — of everything, including the regression
+
+Three hypotheses entered, none survived, and the corpse at the end
+is a MEASUREMENT. H-FUSE-1 (materialization): the post-gather block
+module's temp arena grew by 262 KB (9,426,966,072 vs 9,426,703,416)
+and the graph gained 9 standalone gathers + 11 fusion splits — ~40 ms
+of traffic at [28672,4096] scale, not 5 s. REFUTED by the dump.
+H-FUSE-2 (autotune re-roll): 81 common autotune entries between the
+pre- and post-gather modules, ZERO algorithm differences; the 16
+hipBLASLt matmuls, 9 triton kernels, and the while are structurally
+identical. REFUTED by the dump. H-FUSE-3 (pathological gather
+kernel, adopted by elimination): adaVal rebuilt as a trace-time
+SELECT-CHAIN over the K rows — bit-exact (select copies bits; the
+one-hot-matmul alternative could flip -0.0), 22/22 gates
+BYTE-IDENTICAL to the ORIGINAL pre-gather record (even the few-ulp
+schedule drift reverted: e3w-attn1 back to 1.094e-6) — and the
+production pass ran at 5.90 s/block. REFUTED by substitution.
+
+What actually died: the baseline. The 1.1-1.3 s/block numbers came
+EXCLUSIVELY from wedged-stream runs (7-14) that never completed and
+never printed a wall clock; run 14 logged a 0.23 s block — 27 TFLOP
+of f32 work at over 100 TF/s on a ~25 TF/s-peak card, physically
+impossible. Every COMPLETED run agrees: 297.6 s (gather, logging),
+309.8 s (gather, clean), 283.1 s (select-chain) — ~5.9-6.5 s/block
+with identical algorithms throughout. The pre-gather per-block clock
+was pacing ENQUEUES: the consumer raced ahead of a deeply queued
+compute stream, out.await returning early under the wedged-stream
+pathology (mechanism hypothesis, unconfirmed — what is confirmed is
+that no completed wall ever backed those numbers). Lesson, in the
+permanent collection: A PER-STEP CLOCK IS ONLY AS HONEST AS ITS
+SYNC, and the only trustworthy latency is a completed run's wall.
+
+The record, corrected: the f32 production pass is ~283 s
+(select-chain kept — bit-exact, and the best completed wall by
+5-9%), ~38 min for an 8-step loop. The "recovery target" of
+1.3 s/block dissolves — it never existed. The REAL Phase 6 levers
+stand exactly where E1a left them: the blocks run f32 GEMMs from
+in-graph-converted bf16 weights on a card whose f16 path measured
+59-77 TF/s — the dtype arc (f16/bf16 attention scores and GEMM
+inputs), autotuner pinning, and the staging/readback items are the
+honest path down from 283 s, each with its own gate ladder when its
+turn comes.
