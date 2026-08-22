@@ -2605,3 +2605,41 @@ fourth digit. e2e_denoise: bitwise x0 control, 16/16 gates,
 velocities 1.0e-5..3.5e-5, final latent 1.116e-5 (was 1.004e-5 —
 the schedule drift compounded through 384 block calls and stayed
 180x under budget).
+
+### PHASE 3 CLOSES: the production pass completes end to end — with one honest asterisk
+
+Run 16 (K=3 gather, capped service, allocator logging on): the pass
+COMPLETED for the first time. No OOM anywhere in the log — block 0's
+warmup dropped from the invariant 10.05 s to 6.87 s, direct evidence
+the failed first-attempt arena allocation is gone (that ~3 s was the
+retry). Both readbacks work: the 12-byte device stats AND the full
+14 MB velocity, and the numbers close a five-way consistency chain —
+rms 0.4335 / max_abs 4.1746, byte-matching every configuration that
+ever produced this velocity (chunk-16 run 2, chunk-1024 device stats
+run 12, and now gather-K3 twice). The wedge, the latch, the 8.78 GiB
+ghost: all downstream of one first-call allocation that now simply
+fits, with gigabytes to spare.
+
+The asterisk: blocks now run 6.0-6.9 s (6.45 avg, run 17 clean —
+logging ruled out as the cause), 4-5x the 1.1-3.0 s the same blocks
+ran with the resident full ts9. The gather is elementwise identical
+and numerically fenced, but XLA's fusion around it is not what it
+was — hypothesis: the nine gathered modulation tensors materialize
+instead of fusing into their consumers, and the fusion boundaries
+shifted through the whole graph. Filed as THE OPENING PHASE 6 ITEM,
+pre-registered test: diff the pre-gather and post-gather block HLO
+after-optimization dumps (run 8's module_0239 is the pre-gather
+reference), then either restore fusion or hoist the gathers.
+Recovery target is known, not speculative: 1.3 s/block on this card.
+
+**Phase 3's done-means is SATISFIED.** Latents match the reference
+step-by-step (harness T: 16/16 loop gates, final drift 1.1e-5, x0
+and timesteps bitwise); the full pass fits and runs on the card at
+production length (T=28,672, E3w attention, ring-streamed weights,
+K=3 gathered conditioning, finite velocity read back); time-per-step
+recorded: 309.8 s wall as landed (blocks 309.7 of it), with the
+denoising-loop estimate at ~41 min/8-step pass today and ~10-11 min
+once the gather fusion recovers — against the ~13 min/clip
+off-the-shelf anecdote on lesser hardware, with our VAE and prompt
+path still to come. The remaining phases inherit an engine whose
+every layer has an oracle, a fence, and a receipt.
