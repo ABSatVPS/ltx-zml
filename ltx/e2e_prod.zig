@@ -108,6 +108,11 @@ fn chunkAgreeGate(allocator: std.mem.Allocator, io: std.Io, platform: *zml.Platf
     inline for (.{ "s3Attn1", "wAttn1" }, 0..) |mname, oi| {
         const method = comptime std.meta.stringToEnum(std.meta.DeclEnum(blk.Block), mname).?;
         var exe = try platform.compile(allocator, io, model, method, .{ x_spec, ts_spec, cos_spec, sin_spec }, .{});
+        // Release the gate executable before the production pass: run 12
+        // localized the latched ResourceExhausted to block 0's FIRST
+        // arena allocation retrying past gate leftovers — the failed
+        // attempt poisons every later transfer-stream await.
+        defer exe.deinit();
         var args = try exe.args(allocator);
         defer args.deinit(allocator);
         var results = try exe.results(allocator);
@@ -425,7 +430,14 @@ pub fn main(init: std.process.Init) !void {
         vstats_exe.call(args, &results);
         var st_buf: zml.Buffer = results.get(zml.Buffer);
         defer st_buf.deinit();
-        var st_slice = try st_buf.toSliceAlloc(allocator, io);
+        // The client's async error queue delivers the pass's failed-then-
+        // retried arena attempt to the FIRST post-pass D2H await (runs
+        // 2-13). If the queue-delivery theory is right, the error is
+        // consumed once and a retry reads clean.
+        var st_slice = st_buf.toSliceAlloc(allocator, io) catch |err| blk2: {
+            log.warn("stats readback attempt 0 failed ({t}) — retrying (stale async error theory)", .{err});
+            break :blk2 try st_buf.toSliceAlloc(allocator, io);
+        };
         defer st_slice.free(allocator);
         const st = st_slice.constItems(f32)[0..3];
         const n: f64 = @floatFromInt(Tu * Cu);

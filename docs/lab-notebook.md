@@ -2500,3 +2500,53 @@ readback failure is transfer staging or latched client state. The
 readback path was already Phase 6's named pathology (0.5 GB/s naive
 D2H); it has now also blocked a run, which promotes it in the
 perf-pass queue.
+
+### The allocator's own testimony: the OOM is block 0's first breath, and ts9 is why
+
+Run 14 killed the deliver-once theory (the readback retry re-failed
+identically). Run 15, per the pre-commitment, asked the allocator
+itself (TF_CPP_MIN_LOG_LEVEL=0, TF_CPP_VMODULE=bfc_allocator=1), and
+the dump answers everything at once. The 8.78 GiB failure
+("rounded to 9426703616, requested by op") fires at 08:28:14 —
+AFTER "conditioning + patchify", BEFORE block 0 reports — it is
+block 0's FIRST-ATTEMPT temp-arena allocation, failing on every run
+of every configuration, then succeeding on the allocator's internal
+retry inside the invariant ~10 s block-0 warmup. The pass proceeds
+normally; the failed enqueue leaves the TRANSFER stream wedged, and
+every subsequent D2H — 14 MB velocity, 12-byte stats, first attempt
+or retried — queues behind the corpse and reports its error. That is
+why thirteen otherwise-perfect passes could not hand back one byte.
+Two corroborating receipts from the same log: XLA's rematerializer
+warned at compile that it "can't reduce memory use below 7.07GiB;
+only reduced to 9.22GiB" (the arena is at its floor for chunk 1024),
+and the arithmetic closes the door on tuning: block-0-time residency
+is ~7.1 GB — 4.23 GB of it the f32 ts9 — so even a 0.95 pool with
+every trimmable buffer dropped tops out ~8.6 GB free against the
+8.78 GiB ask. No fraction fixes this while f32 ts9 sits resident;
+0.95+ kills the desktop instead (already receipted).
+
+### Pre-registration: the ts9 gather — K distinct timestep rows, not T
+
+The per-token conditioning tensor is combinatorially tiny: per-token
+timesteps are denoise_mask x sigma, and a production mask holds a
+handful of distinct values (binary mask: 2; our harness convention:
+3). The redesign: blocks take ts as a K-row TABLE [K, 9, D] plus a
+per-token i32 INDEX [T]; adaVal gathers the row per token. Harness
+and conformance run K=T with an identity index — the gathered values
+are ELEMENTWISE IDENTICAL to today's, so all 22 block gates, the
+walk, and the e2e suites re-fence the refactor and are expected
+bitwise-stable. Production runs K=3: the resident conditioning drops
+from 4.23 GB to ~0.5 MB, block-0's first arena attempt fits with
+gigabytes to spare (no failed enqueue, no wedged stream, readback
+lives), and the per-step conditioning upload in the eventual
+denoising loop drops from 4.2 GB to half a megabyte. One contract
+change, three birds: the crash-adjacent OOM, the readback, and a
+Phase 6 upload line-item.
+
+Timing on the record from the thirteen green passes at PCHUNK=1024:
+compile ~54 s once; conditioning + patchify ~1.5 s; block 0 ~10 s
+(warmup + the arena retry); blocks thereafter 1.1-3.0 s (typically
+~1.3); tail sub-second. Step estimate ~75-90 s, exact wall to be
+recorded when the gather run's readback closes the loop. The capped
+systemd-run discipline held: MemoryPeak pinned at exactly the 9 GiB
+cap with the desktop untouched across four consecutive runs.
