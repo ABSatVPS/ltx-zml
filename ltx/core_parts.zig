@@ -141,8 +141,7 @@ pub const CoreParts = struct {
         return lin(latent, self.pat_w, self.pat_b);
     }
 
-    fn tailFrom(self: @This(), normed: zml.Tensor, t: zml.Tensor) zml.Tensor {
-        const e = self.emb(t); // [.t,.i]
+    fn tailFrom(self: @This(), normed: zml.Tensor, e: zml.Tensor) zml.Tensor {
         const shift = self.fsst.slice1d(.n, .{ .start = 0, .end = 1 }).squeeze(.n).broad(e.shape()).add(e);
         const scl = self.fsst.slice1d(.n, .{ .start = 1, .end = 2 }).squeeze(.n).broad(e.shape()).add(e);
         return lin(blk.modulate(normed, scl, shift), self.po_w, self.po_b);
@@ -151,14 +150,23 @@ pub const CoreParts = struct {
     /// output tail: LayerNorm -> x*(1+scale)+shift -> proj_out, with
     /// shift/scale = scale_shift_table row + RAW embedded_timestep.
     pub fn tail(self: @This(), x: zml.Tensor, t: zml.Tensor) zml.Tensor {
-        return self.tailFrom(layerNormNoW(x), t);
+        return self.tailFrom(layerNormNoW(x), self.emb(t));
+    }
+
+    /// The tail with embedded_timestep as an INPUT instead of recomputed.
+    /// Production form (H-PROD run-4 finding): the fused recompute graph's
+    /// temp arena is ~20 [T,D] buffers in ONE contiguous allocation —
+    /// 8.78 GiB at T=28,672 — which fits an empty pool but not the
+    /// post-pass fragmented one. Splitting emb out roughly halves it.
+    pub fn tailFromEmb(self: @This(), x: zml.Tensor, e: zml.Tensor) zml.Tensor {
+        return self.tailFrom(layerNormNoW(x), e);
     }
 
     /// deliberate wrong-norm control (RMSNorm in the tail) — must FAIL the
     /// s6 gate by orders of magnitude, proving the gate can tell the norms
     /// apart (H-CORE-4), and must MATCH the oracle's own wrong-norm dump.
     pub fn tailWrong(self: @This(), x: zml.Tensor, t: zml.Tensor) zml.Tensor {
-        return self.tailFrom(blk.rmsNoW(x), t);
+        return self.tailFrom(blk.rmsNoW(x), self.emb(t));
     }
 };
 

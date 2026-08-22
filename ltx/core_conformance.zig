@@ -107,6 +107,9 @@ pub fn main(init: std.process.Init) !void {
     const x_h = try loadF32(allocator, io, BUNDLE, "in_xfinal.bin", Tu * Du);
     defer allocator.free(x_h);
 
+    const e_h = try loadF32(allocator, io, BUNDLE, "s2_embedded_timestep.bin", Tu * Du);
+    defer allocator.free(e_h);
+
     const t_shape = zml.Shape.init(.{ .t = T }, .f32);
     const sg_shape = zml.Shape.init(.{ .t = 1 }, .f32);
     const lat_shape = zml.Shape.init(.{ .t = T, .i = IN_CH }, .f32);
@@ -120,6 +123,8 @@ pub fn main(init: std.process.Init) !void {
     defer lat_buf.deinit();
     var x_buf: zml.Buffer = try .fromBytes(io, platform, x_shape, .replicated, std.mem.sliceAsBytes(x_h));
     defer x_buf.deinit();
+    var e_buf: zml.Buffer = try .fromBytes(io, platform, x_shape, .replicated, std.mem.sliceAsBytes(e_h));
+    defer e_buf.deinit();
 
     const t_spec: zml.Tensor = .fromShape(t_shape);
     const sg_spec: zml.Tensor = .fromShape(sg_shape);
@@ -133,7 +138,7 @@ pub fn main(init: std.process.Init) !void {
         len: usize,
         width: usize,
         limit: f64,
-        args: enum { t, sg, lat, xt },
+        args: enum { t, sg, lat, xt, xe },
     };
     const stages = [_]Stage{
         // sinusoid: the interesting gate (H-CORE-2) — both sides f32, but
@@ -145,6 +150,9 @@ pub fn main(init: std.process.Init) !void {
         .{ .method = "pts2", .oracle = "s4_pts2.bin", .len = 2 * Du, .width = 2 * Du, .limit = 2e-3, .args = .sg },
         .{ .method = "patchify", .oracle = "s5_patchify.bin", .len = Tu * Du, .width = Du, .limit = 2e-3, .args = .lat },
         .{ .method = "tail", .oracle = "s6_tail_out.bin", .len = Tu * 128, .width = 128, .limit = 2e-3, .args = .xt },
+        // the production form (emb as input, fed the ORACLE's emb dump)
+        // must hit the SAME oracle tail output
+        .{ .method = "tailFromEmb", .oracle = "s6_tail_out.bin", .len = Tu * 128, .width = 128, .limit = 2e-3, .args = .xe },
         // the control must MATCH the oracle's wrong-norm dump...
         .{ .method = "tailWrong", .oracle = "s6_tail_wrongnorm.bin", .len = Tu * 128, .width = 128, .limit = 2e-3, .args = .xt },
     };
@@ -159,6 +167,7 @@ pub fn main(init: std.process.Init) !void {
             .sg => try platform.compile(allocator, io, model, method, .{sg_spec}, .{}),
             .lat => try platform.compile(allocator, io, model, method, .{lat_spec}, .{}),
             .xt => try platform.compile(allocator, io, model, method, .{ x_spec, t_spec }, .{}),
+            .xe => try platform.compile(allocator, io, model, method, .{ x_spec, zml.Tensor.fromShape(x_shape) }, .{}),
         };
         var args = try exe.args(allocator);
         defer args.deinit(allocator);
@@ -169,6 +178,7 @@ pub fn main(init: std.process.Init) !void {
             .sg => args.set(.{ bufs, sg_buf }),
             .lat => args.set(.{ bufs, lat_buf }),
             .xt => args.set(.{ bufs, x_buf, t_buf }),
+            .xe => args.set(.{ bufs, x_buf, e_buf }),
         }
         exe.call(args, &results);
         var out: zml.Buffer = results.get(zml.Buffer);

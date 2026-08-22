@@ -2406,3 +2406,54 @@ post-fix, attention returns to ~1.2-1.5 s and the block lands at
 ~2.5-4 min. If the block stays slow after the chunk fix, the
 hypothesis is wrong and the next suspect is the f32 GEMM rate
 itself (the 59-77 TFLOP/s anchors are f16 numbers).
+
+## 2026-08-22 — the chunk fix lands, then an OOM chase; a crash; the state as re-entered
+
+(Continuity note: yesterday's session died with the desktop again —
+second time a "detached" run went down with the ship; nohup+setsid
+does not survive a session-manager teardown. Run 6 was the casualty,
+killed mid-pass. Everything below up to run 6 happened before the
+crash and is reconstructed from the run logs, which survived.)
+
+The chunk fix: whileSdpa is now comptime-chunk-parametric with
+trace-time selection (PCHUNK=1024 when the K length divides, else
+ACHUNK=16), the 22-gate suite reproduced its historical numbers
+bitwise (harness graphs provably untouched), and the new
+chunk-agree@T4096 gate — full-block E3w at chunk 1024 vs the
+torch-anchored dense twin on block-0 weights — passed at 8.383e-7.
+Run 2 then measured H-PROD-2b's prediction almost exactly: blocks
+dropped from 27.88 s to 1.1-3.0 s (block 0 always ~10 s of
+first-touch warmup). The 1,792-sliver-GEMM diagnosis was right.
+
+Then the pass OOMed at the very last call, and the chase is worth
+its receipts. The tail executable's invocation, after all 48 blocks,
+failed with a ResourceExhausted ask of 8.78 GiB — and that ask
+stayed BYTE-IDENTICAL across three structurally different tail
+designs: run 3 (ts9's 4.23 GB freed before the tail — same OOM),
+run 4 (a probe call of the SAME tail exe at startup SUCCEEDED on the
+young pool, the end-of-pass call still failed — so the demand is
+satisfiable, the post-pass pool is not), run 5 (the tail rebuilt as
+tailFromEmb, taking embedded_timestep as a 470 MB input instead of
+recomputing it — a much smaller graph, gated at 3.052e-7 against the
+same oracle dump in core_conformance — and the ask was STILL
+8.78 GiB). An ask that ignores the graph it nominally serves is not
+that graph's demand: the working theory is BFC pool mechanics — the
+chunk-1024 while workspace (s and p are each [32, 28672, 1024] f32,
+7.0 GiB the pair) leaves the 14.4 GB pool (0.90 fraction default,
+preallocated) unable to seat one large contiguous region, and the
+8.78 GiB constant (suspiciously ~20x the 470 MB [T,D] buffer) is
+whatever the allocator reaches for at the first post-pass demand.
+Unresolved; the number deserves a buffer-assignment dump when it
+next blocks progress.
+
+Run 6 (before the crash killed it): PCHUNK=512 to halve the while
+workspace, pool fraction raised to 0.95. The gate passed at 8.050e-7
+— and blocks ran at 5.9 s, FOUR TIMES slower than chunk 1024. Chunk
+512 is a measured perf cliff, not a safe shrink; reverted to 1024.
+The 0.95 fraction and the tailFromEmb split are kept.
+
+Run 7, pre-registered: chunk 1024 + pool 0.95 + the small (x, e)
+tail + ts9/pts2 freed pre-tail + an "invoking tail" log line pinning
+the failure point. If the 8.78 GiB ask still fires, next lever is
+diagnostic, not structural: dump the allocator's view (or bisect by
+calling the tiny emb exe post-pass) before touching more code.

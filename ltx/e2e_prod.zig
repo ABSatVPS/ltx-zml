@@ -54,6 +54,85 @@ fn loadCoreBufs(allocator: std.mem.Allocator, io: std.Io, platform: *zml.Platfor
     return bufs;
 }
 
+/// Pre-pass agreement gate (pre-registered with the chunk fix): chunk
+/// 1024 has never run inside the full block, so before the production
+/// pass, wAttn1 (auto-selecting PCHUNK at this length) must agree with
+/// the dense twin — torch-anchored at the harness — on block-0 weights
+/// at T=4096, budget 1e-5 per the E3w agreement precedent.
+fn chunkAgreeGate(allocator: std.mem.Allocator, io: std.Io, platform: *zml.Platform, blob: *const ldr.Blob) !bool {
+    const TG: i64 = 4096;
+    const TGu: usize = @intCast(TG);
+    var prng = std.Random.DefaultPrng.init(0x5a5a1234);
+    const rnd = prng.random();
+
+    const x_h = try allocator.alloc(f32, TGu * Du);
+    defer allocator.free(x_h);
+    for (x_h) |*x| x.* = (rnd.float(f32) - 0.5) * 1.4;
+    const ts_h = try allocator.alloc(f32, TGu * 9 * Du);
+    defer allocator.free(ts_h);
+    for (ts_h) |*x| x.* = (rnd.float(f32) - 0.5) * 0.2;
+    const cos_h = try allocator.alloc(f32, TGu * Hu * 64);
+    defer allocator.free(cos_h);
+    const sin_h = try allocator.alloc(f32, TGu * Hu * 64);
+    defer allocator.free(sin_h);
+    for (cos_h, sin_h) |*c, *s| {
+        const a = rnd.float(f32) * std.math.tau;
+        c.* = @cos(a);
+        s.* = @sin(a);
+    }
+
+    const x_shape = zml.Shape.init(.{ .t = TG, .i = blk.D }, .f32);
+    const ts_shape = zml.Shape.init(.{ .t = TG, .n = 9, .i = blk.D }, .f32);
+    const pe_shape = zml.Shape.init(.{ .q = TG, .h = blk.H, .f = 64 }, .f32);
+    var x_buf: zml.Buffer = try .fromBytes(io, platform, x_shape, .replicated, std.mem.sliceAsBytes(x_h));
+    defer x_buf.deinit();
+    var ts_buf: zml.Buffer = try .fromBytes(io, platform, ts_shape, .replicated, std.mem.sliceAsBytes(ts_h));
+    defer ts_buf.deinit();
+    var cos_buf: zml.Buffer = try .fromBytes(io, platform, pe_shape, .replicated, std.mem.sliceAsBytes(cos_h));
+    defer cos_buf.deinit();
+    var sin_buf: zml.Buffer = try .fromBytes(io, platform, pe_shape, .replicated, std.mem.sliceAsBytes(sin_h));
+    defer sin_buf.deinit();
+
+    var bufs = try ldr.buildBlockBufs(io, platform, blob, blob.data, 0);
+    defer deinitBlockBufs(&bufs);
+
+    const model = blk.makeBlockSpecs();
+    const x_spec: zml.Tensor = .fromShape(x_shape);
+    const ts_spec: zml.Tensor = .fromShape(ts_shape);
+    const cos_spec: zml.Tensor = .fromShape(pe_shape);
+    const sin_spec: zml.Tensor = .fromShape(pe_shape);
+
+    const outs: [2][]f32 = .{ try allocator.alloc(f32, TGu * Du), try allocator.alloc(f32, TGu * Du) };
+    defer allocator.free(outs[0]);
+    defer allocator.free(outs[1]);
+    inline for (.{ "s3Attn1", "wAttn1" }, 0..) |mname, oi| {
+        const method = comptime std.meta.stringToEnum(std.meta.DeclEnum(blk.Block), mname).?;
+        var exe = try platform.compile(allocator, io, model, method, .{ x_spec, ts_spec, cos_spec, sin_spec }, .{});
+        var args = try exe.args(allocator);
+        defer args.deinit(allocator);
+        var results = try exe.results(allocator);
+        defer results.deinit(allocator);
+        args.set(.{ bufs, x_buf, ts_buf, cos_buf, sin_buf });
+        exe.call(args, &results);
+        var out: zml.Buffer = results.get(zml.Buffer);
+        defer out.deinit();
+        var slice = try out.toSliceAlloc(allocator, io);
+        defer slice.free(allocator);
+        @memcpy(outs[oi], slice.constItems(f32)[0 .. TGu * Du]);
+    }
+    var err: f64 = 0;
+    var ref: f64 = 0;
+    for (outs[1], outs[0]) |g, w| {
+        const d = @as(f64, g) - @as(f64, w);
+        err += d * d;
+        ref += @as(f64, w) * w;
+    }
+    const rms = @sqrt(err / (ref + 1e-20));
+    const pass = rms <= 1e-5;
+    log.info("GATE chunk-agree@T4096 (PCHUNK vs dense): rel-RMS {e:.3} -> {s}", .{ rms, if (pass) "PASS" else "FAIL" });
+    return pass;
+}
+
 fn finiteStats(name: []const u8, v: []const f32) !void {
     var nan: usize = 0;
     var sum2: f64 = 0;
@@ -88,8 +167,15 @@ pub fn main(init: std.process.Init) !void {
     }
     log.info("48 blobs open, layouts OK", .{});
 
-    const platform: *zml.Platform = try .auto(allocator, io, .{});
+    const platform: *zml.Platform = try .auto(allocator, io, .{
+        .xla_gpu = .{ .allocator = .{ .bfc = .{ .preallocate = true, .memory_fraction = 0.95 } } },
+    });
     log.info("platform: {s}", .{@tagName(platform.target)});
+
+    if (!try chunkAgreeGate(allocator, io, platform, &blobs[0])) {
+        log.err("chunk agreement gate failed — stopping before the production pass", .{});
+        return error.ChunkAgreeFailed;
+    }
 
     const slot_stride = std.mem.alignForward(usize, max_bytes, 4096);
     const ring_mem = try std.heap.page_allocator.alignedAlloc(u8, .fromByteUnits(4096), ldr.HOST_SLOTS * slot_stride);
@@ -169,15 +255,34 @@ pub fn main(init: std.process.Init) !void {
     const patchify_m = comptime std.meta.stringToEnum(std.meta.DeclEnum(core.CoreParts), "patchify").?;
     const ts9r_m = comptime std.meta.stringToEnum(std.meta.DeclEnum(core.CoreParts), "ts9r").?;
     const pts2r_m = comptime std.meta.stringToEnum(std.meta.DeclEnum(core.CoreParts), "pts2r").?;
-    const tail_m = comptime std.meta.stringToEnum(std.meta.DeclEnum(core.CoreParts), "tail").?;
+    const emb_m = comptime std.meta.stringToEnum(std.meta.DeclEnum(core.CoreParts), "emb").?;
+    const tail_m = comptime std.meta.stringToEnum(std.meta.DeclEnum(core.CoreParts), "tailFromEmb").?;
     var patchify_exe = try platform.compile(allocator, io, cmodel, patchify_m, .{lat_spec}, .{});
     var ts9r_exe = try platform.compile(allocator, io, cmodel, ts9r_m, .{t_spec}, .{});
     var pts2r_exe = try platform.compile(allocator, io, cmodel, pts2r_m, .{sg_spec}, .{});
-    var tail_exe = try platform.compile(allocator, io, cmodel, tail_m, .{ x_spec, t_spec }, .{});
+    var emb_exe = try platform.compile(allocator, io, cmodel, emb_m, .{t_spec}, .{});
+    var tail_exe = try platform.compile(allocator, io, cmodel, tail_m, .{ x_spec, zml.Tensor.fromShape(x_shape) }, .{});
     const model = blk.makeBlockSpecs();
     const wblk_m = comptime std.meta.stringToEnum(std.meta.DeclEnum(blk.Block), "wBlockOut").?;
     var blk_exe = try platform.compile(allocator, io, model, wblk_m, .{ x_spec, ts_spec, ctx_spec, pts_spec, cos_spec, sin_spec }, .{});
-    log.info("5 executables compiled at T={d} in {d:.1} s", .{ TP, @as(f64, @floatFromInt(@as(u64, @intCast(nowNs(io) - compile_t0)))) / 1e9 });
+    log.info("6 executables compiled at T={d} in {d:.1} s", .{ TP, @as(f64, @floatFromInt(@as(u64, @intCast(nowNs(io) - compile_t0)))) / 1e9 });
+
+    // emb once, resident for the whole pass (470 MB) — the tail takes it
+    // as input. Run-4 receipts: the RECOMPUTING tail's fused graph needed
+    // one contiguous 8.78 GiB temp arena (~20 [T,D] buffers), which fits
+    // an empty pool (probe PASSed) but not the post-pass fragmented one.
+    var e_buf: zml.Buffer = undefined;
+    {
+        var args = try emb_exe.args(allocator);
+        defer args.deinit(allocator);
+        var results = try emb_exe.results(allocator);
+        defer results.deinit(allocator);
+        args.set(.{ cbufs, t_buf });
+        emb_exe.call(args, &results);
+        e_buf = results.get(zml.Buffer);
+        try e_buf.await(io);
+    }
+    defer e_buf.deinit();
 
     // ---- ring -------------------------------------------------------------
     var schedule: [N_BLOCKS]usize = undefined;
@@ -233,8 +338,6 @@ pub fn main(init: std.process.Init) !void {
         x_cur = results.get(zml.Buffer);
         try x_cur.await(io);
     }
-    defer ts_buf.deinit();
-    defer pts_buf.deinit();
     const cond_ns: u64 = @intCast(nowNs(io) - step_t0);
     log.info("conditioning + patchify on device: {d:.2} s", .{@as(f64, @floatFromInt(cond_ns)) / 1e9});
 
@@ -264,13 +367,20 @@ pub fn main(init: std.process.Init) !void {
         }
     }
 
+    // The tail needs only x and e — release the 4.23 GB ts9 (and pts2)
+    // FIRST (H-PROD runs 3-5: the tail call OOMed on a constant 8.78 GiB
+    // ask regardless of tail-graph size — pool-state, not graph demand).
+    ts_buf.deinit();
+    pts_buf.deinit();
+    log.info("ts9/pts2 released; invoking tail", .{});
+
     var vel_buf: zml.Buffer = undefined;
     {
         var args = try tail_exe.args(allocator);
         defer args.deinit(allocator);
         var results = try tail_exe.results(allocator);
         defer results.deinit(allocator);
-        args.set(.{ cbufs, x_cur, t_buf });
+        args.set(.{ cbufs, x_cur, e_buf });
         tail_exe.call(args, &results);
         vel_buf = results.get(zml.Buffer);
     }

@@ -60,11 +60,17 @@ pub fn rope(x4: zml.Tensor, cos: zml.Tensor, sin: zml.Tensor) zml.Tensor {
 /// T≈28k, where dense scores would need ~100 GB (run 7/8b).
 pub const Algo = enum { dense, blockwise };
 
-/// E3w chunk for the f32 twin. Module const because the while body is a
-/// nested fn and cannot close over runtime values. 16 gives 4 iterations
+/// E3w chunk for the f32 twin at HARNESS length. 16 gives 4 iterations
 /// over T=64, so the rescale-correction path runs 3 times; a single chunk
 /// of T would degenerate into plain softmax and test only loop plumbing.
 pub const ACHUNK: i64 = 16;
+
+/// E3w chunk at PRODUCTION length. E3's smoke measured 1.22 s at
+/// WCHUNK=1024; the H-PROD walk proved why this cannot be ACHUNK (16 at
+/// T=28,672 = 1,792 latency-bound sliver GEMMs, 27.9 s/block). 512 was
+/// TRIED to halve the while workspace and measured 4x SLOWER
+/// (5.9 s/block, run 6) — 1024 is the plateau's edge, keep it.
+pub const PCHUNK: i64 = 1024;
 
 /// The E3w kernel's f32 twin: the same loop-carried (step, m, l, acc)
 /// while as smoke.zig's blockwiseWhileSdpaGraph, but f32 matmuls (the
@@ -72,10 +78,18 @@ pub const ACHUNK: i64 = 16;
 /// zml.nn.sdpa applies it — so the agreement gate sees ONLY the
 /// online-softmax algorithm. q3 [.q,.h,.hd], k3/v3 [.k,.h,.hd]; returns
 /// [.h,.q,.hd] (dot leads with batch dims).
+/// Trace-time chunk selection: production geometry when the K length
+/// divides by it, harness geometry otherwise. Keeps every T=64 graph
+/// BITWISE identical to the pre-PCHUNK record (the 22-gate fence).
 pub fn whileSdpa(q3: zml.Tensor, k3: zml.Tensor, v3: zml.Tensor) zml.Tensor {
+    if (@rem(k3.dim(.k), PCHUNK) == 0) return whileSdpaC(PCHUNK, q3, k3, v3);
+    return whileSdpaC(ACHUNK, q3, k3, v3);
+}
+
+pub fn whileSdpaC(comptime chunk: i64, q3: zml.Tensor, k3: zml.Tensor, v3: zml.Tensor) zml.Tensor {
     const tq = q3.dim(.q); // trace-time; T is only the harness default
-    std.debug.assert(@rem(k3.dim(.k), ACHUNK) == 0);
-    const n_chunks: i64 = @divExact(k3.dim(.k), ACHUNK);
+    std.debug.assert(@rem(k3.dim(.k), chunk) == 0);
+    const n_chunks: i64 = @divExact(k3.dim(.k), chunk);
     const hd_f: f32 = @floatFromInt(HD);
     const k = k3.mul(zml.Tensor.scalar(1.0 / @sqrt(hd_f), .f32));
 
@@ -93,9 +107,9 @@ pub fn whileSdpa(q3: zml.Tensor, k3: zml.Tensor, v3: zml.Tensor) zml.Tensor {
             return step.cmp(.LT, c.n);
         }
         fn body(step: zml.Tensor, m: zml.Tensor, l: zml.Tensor, acc: zml.Tensor, c: Ctx) [4]zml.Tensor {
-            const off = step.mul(zml.Tensor.scalar(ACHUNK, .i32));
-            const kc = c.k.dynamicSlice(.{ .k = zml.Tensor.DynSlice{ .start = off, .len = ACHUNK } });
-            const vc = c.v.dynamicSlice(.{ .k = zml.Tensor.DynSlice{ .start = off, .len = ACHUNK } });
+            const off = step.mul(zml.Tensor.scalar(chunk, .i32));
+            const kc = c.k.dynamicSlice(.{ .k = zml.Tensor.DynSlice{ .start = off, .len = chunk } });
+            const vc = c.v.dynamicSlice(.{ .k = zml.Tensor.DynSlice{ .start = off, .len = chunk } });
             const s = c.q.dot(kc, .hd); // [.h,.q,.k]
             const cmax = s.max(.k).squeeze(.k); // [.h,.q]
             const m_new = m.maximum(cmax);
