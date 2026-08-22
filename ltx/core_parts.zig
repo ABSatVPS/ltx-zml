@@ -162,6 +162,13 @@ pub const CoreParts = struct {
         return self.tailFrom(layerNormNoW(x), e);
     }
 
+    /// stats of an arbitrary [.t,.i] tensor (method form so it compiles
+    /// through the standard model/method path; weights unused).
+    pub fn velStats(self: @This(), v: zml.Tensor) zml.Tensor {
+        _ = self;
+        return statsOf(v);
+    }
+
     /// deliberate wrong-norm control (RMSNorm in the tail) — must FAIL the
     /// s6 gate by orders of magnitude, proving the gate can tell the norms
     /// apart (H-CORE-4), and must MATCH the oracle's own wrong-norm dump.
@@ -169,6 +176,18 @@ pub const CoreParts = struct {
         return self.tailFrom(blk.rmsNoW(x), self.emb(t));
     }
 };
+
+/// Device-side sanity stats for a [.t,.i] tensor: [bad_count, sum_sq,
+/// max_abs] as a 3-vector, so structural checks need a 12-byte readback
+/// instead of the full tensor (H-PROD run-10 finding: the full-velocity
+/// D2H is where the post-pass ResourceExhausted surfaces).
+pub fn statsOf(v: zml.Tensor) zml.Tensor {
+    const sh1 = zml.Shape.init(.{ .s = 1 }, .f32);
+    const bad = v.cmp(.NE, v).convert(.f32).sum(.i).squeeze(.i).sum(.t).squeeze(.t).reshape(sh1);
+    const ss = v.mul(v).sum(.i).squeeze(.i).sum(.t).squeeze(.t).reshape(sh1);
+    const ma = v.abs().max(.i).squeeze(.i).max(.t).squeeze(.t).reshape(sh1);
+    return zml.Tensor.concatenate(&.{ bad, ss, ma }, .s);
+}
 
 pub fn makeCoreSpecs() CoreParts {
     var m: CoreParts = undefined;

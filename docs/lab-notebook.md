@@ -2457,3 +2457,46 @@ tail + ts9/pts2 freed pre-tail + an "invoking tail" log line pinning
 the failure point. If the 8.78 GiB ask still fires, next lever is
 diagnostic, not structural: dump the allocator's view (or bisect by
 calling the tiny emb exe post-pass) before touching more code.
+
+## 2026-08-22 — the crashes were the RUN's fault: two resource ceilings, found in the kernel journal
+
+Two more desktop crashes killed runs 6 and 11 mid-flight, and Adam
+asked the right question: cap the runs so THEY fail first. The
+journal has the receipts, and they indict this experiment on both
+resource axes at once. VRAM: `amdgpu: Not enough memory for command
+submission!` followed by `Failed to pin framebuffer with error -12`
+at both crash times — the RX 9060 XT drives the DISPLAY, and run 6's
+memory_fraction bump to 0.95 (15.2 of 16 GB) left the compositor
+unable to pin its framebuffer. Run 2 at the 0.90 default ran the
+whole pass without touching the session; 0.95 is over the line.
+Reverted to 0.90, with the reason in a comment. RAM: at this
+morning's crash, `gnome-session-manager: oom-kill` and
+`org.gnome.Shell: oom-kill` — the XLA compile phase peaks ~6.5 GB
+RSS, bazel's JVM holds ~2 GB, the ring pins 1.05 GB, and on 15 GB
+the kernel's OOM killer chose the desktop over the binary.
+
+New run discipline, effective immediately for anything
+production-sized: build with bazel, SHUT THE BAZEL SERVER DOWN
+(frees its ~2 GB), and execute the bazel-bin binary directly as a
+transient systemd user service — `systemd-run --user -p MemoryMax=9G
+-p MemorySwapMax=512M` — so the cgroup OOM killer takes the RUN, the
+low swap cap prevents thrash-freeze, and the service survives
+terminal crashes better than nohup+setsid ever did (which, third
+data point, does NOT survive a session teardown). The binary runs
+fine outside bazel (it finds its runfiles).
+
+Debug state carried into the capped run (12): the 8.78 GiB
+ResourceExhausted was chased from the tail (three designs — all
+misses; the tail executes CLEANLY, proven by run 10's silent retry
+ladder) to its true site: the FULL-VELOCITY D2H readback, whose
+await carries the error, with the constant ask exactly matching the
+block executable's preallocated-temp (allocation 75, 9,426,703,416
+bytes, from the buffer-assignment dump — the dump also priced every
+executable: tail temp is 476 MB, ts9r 1.08 GB, block 8.78 GiB).
+Run 12 therefore reads back 12 BYTES of device-computed stats
+(nan/rms/max reduced on-card) as the structural check and attempts
+the full readback second, as a diagnostic bit — pinning whether the
+readback failure is transfer staging or latched client state. The
+readback path was already Phase 6's named pathology (0.5 GB/s naive
+D2H); it has now also blocked a run, which promotes it in the
+perf-pass queue.

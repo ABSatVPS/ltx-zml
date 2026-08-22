@@ -167,8 +167,12 @@ pub fn main(init: std.process.Init) !void {
     }
     log.info("48 blobs open, layouts OK", .{});
 
+    // 0.90, NOT higher: this card drives the display. The 0.95 experiment
+    // starved the compositor's framebuffer pin (amdgpu -12, journalctl
+    // 2026-08-21/22) and took the desktop down with the run. 0.90 ran the
+    // full pass in run 2 without touching the session.
     const platform: *zml.Platform = try .auto(allocator, io, .{
-        .xla_gpu = .{ .allocator = .{ .bfc = .{ .preallocate = true, .memory_fraction = 0.95 } } },
+        .xla_gpu = .{ .allocator = .{ .bfc = .{ .preallocate = true, .memory_fraction = 0.90 } } },
     });
     log.info("platform: {s}", .{@tagName(platform.target)});
 
@@ -262,10 +266,13 @@ pub fn main(init: std.process.Init) !void {
     var pts2r_exe = try platform.compile(allocator, io, cmodel, pts2r_m, .{sg_spec}, .{});
     var emb_exe = try platform.compile(allocator, io, cmodel, emb_m, .{t_spec}, .{});
     var tail_exe = try platform.compile(allocator, io, cmodel, tail_m, .{ x_spec, zml.Tensor.fromShape(x_shape) }, .{});
+    const vstats_m = comptime std.meta.stringToEnum(std.meta.DeclEnum(core.CoreParts), "velStats").?;
+    const vel_shape = zml.Shape.init(.{ .t = TP, .i = core.IN_CH }, .f32);
+    var vstats_exe = try platform.compile(allocator, io, cmodel, vstats_m, .{zml.Tensor.fromShape(vel_shape)}, .{});
     const model = blk.makeBlockSpecs();
     const wblk_m = comptime std.meta.stringToEnum(std.meta.DeclEnum(blk.Block), "wBlockOut").?;
     var blk_exe = try platform.compile(allocator, io, model, wblk_m, .{ x_spec, ts_spec, ctx_spec, pts_spec, cos_spec, sin_spec }, .{});
-    log.info("6 executables compiled at T={d} in {d:.1} s", .{ TP, @as(f64, @floatFromInt(@as(u64, @intCast(nowNs(io) - compile_t0)))) / 1e9 });
+    log.info("7 executables compiled at T={d} in {d:.1} s", .{ TP, @as(f64, @floatFromInt(@as(u64, @intCast(nowNs(io) - compile_t0)))) / 1e9 });
 
     // emb once, resident for the whole pass (470 MB) — the tail takes it
     // as input. Run-4 receipts: the RECOMPUTING tail's fused graph needed
@@ -367,15 +374,24 @@ pub fn main(init: std.process.Init) !void {
         }
     }
 
-    // The tail needs only x and e — release the 4.23 GB ts9 (and pts2)
-    // FIRST (H-PROD runs 3-5: the tail call OOMed on a constant 8.78 GiB
-    // ask regardless of tail-graph size — pool-state, not graph demand).
+    // The tail needs only x and e — release the 4.23 GB ts9 (and pts2),
+    // and DESTROY THE BLOCK EXECUTABLE: the buffer-assignment dump
+    // identified the constant 8.78 GiB post-pass ask as the block exe's
+    // own preallocated-temp arena (allocation 75, 9,426,703,416 bytes),
+    // re-requested at the next executable invocation. The tail's temp is
+    // 476 MB; it was never the problem (H-PROD runs 2-8, notebook).
     ts_buf.deinit();
     pts_buf.deinit();
-    log.info("ts9/pts2 released; invoking tail", .{});
+    blk_exe.deinit();
+    log.info("ts9/pts2 + block exe released; invoking tail", .{});
 
+    // Diagnostic ladder (H-PROD run 9's stack trace: the OOM surfaces at
+    // the readback await, i.e. the tail EXECUTION fails async; the same
+    // exe ran fine on a young pool in run 4's probe): attempt, and on
+    // ResourceExhausted wait for deferred deallocations to land, retry.
     var vel_buf: zml.Buffer = undefined;
-    {
+    var attempt: usize = 0;
+    while (true) : (attempt += 1) {
         var args = try tail_exe.args(allocator);
         defer args.deinit(allocator);
         var results = try tail_exe.results(allocator);
@@ -383,13 +399,52 @@ pub fn main(init: std.process.Init) !void {
         args.set(.{ cbufs, x_cur, e_buf });
         tail_exe.call(args, &results);
         vel_buf = results.get(zml.Buffer);
+        if (vel_buf.await(io)) |_| {
+            if (attempt > 0) log.info("tail retry {d} SUCCEEDED — transient pool state confirmed", .{attempt});
+            break;
+        } else |err| {
+            log.warn("tail attempt {d} failed: {t}", .{ attempt, err });
+            vel_buf.deinit();
+            if (attempt >= 3) return err;
+            try std.Io.sleep(io, .fromMilliseconds(1000), .awake);
+        }
     }
     x_cur.deinit();
-    var vslice = try vel_buf.toSliceAlloc(allocator, io);
     const wall_ns: u64 = @intCast(nowNs(io) - step_t0);
 
-    try finiteStats("velocity", vslice.constItems(f32)[0 .. Tu * Cu]);
-    vslice.free(allocator);
+    // Tiny readback first (12 bytes of device-computed stats) — run-10
+    // showed the FULL-velocity D2H is where the 8.78 GiB ask surfaces,
+    // while the tail itself executes cleanly. If even 12 bytes fail, the
+    // error is latched client state, not transfer staging.
+    {
+        var args = try vstats_exe.args(allocator);
+        defer args.deinit(allocator);
+        var results = try vstats_exe.results(allocator);
+        defer results.deinit(allocator);
+        args.set(.{ cbufs, vel_buf });
+        vstats_exe.call(args, &results);
+        var st_buf: zml.Buffer = results.get(zml.Buffer);
+        defer st_buf.deinit();
+        var st_slice = try st_buf.toSliceAlloc(allocator, io);
+        defer st_slice.free(allocator);
+        const st = st_slice.constItems(f32)[0..3];
+        const n: f64 = @floatFromInt(Tu * Cu);
+        const rms = @sqrt(@as(f64, st[1]) / n);
+        log.info("CHECK velocity (device stats): nan/inf {d:.0}, rms {d:.4}, max_abs {d:.4} -> {s}", .{
+            st[0], rms, st[2], if (st[0] == 0) "PASS" else "FAIL",
+        });
+        if (st[0] != 0) return error.NonFinite;
+    }
+
+    // Full readback, attempted second, outcome logged either way — the
+    // diagnostic bit for the D2H mechanism.
+    if (vel_buf.toSliceAlloc(allocator, io)) |vslice_v| {
+        var vslice = vslice_v;
+        try finiteStats("velocity (full readback)", vslice.constItems(f32)[0 .. Tu * Cu]);
+        vslice.free(allocator);
+    } else |err| {
+        log.warn("full-velocity readback failed ({t}) — device stats above stand; readback path is the known Phase 6 item", .{err});
+    }
     vel_buf.deinit();
 
     log.info("PRODUCTION PASS: {d:.2} s wall (blocks {d:.2} s, {d:.2} s/block avg), reader parks {d}, consumer parks {d}", .{
