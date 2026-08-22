@@ -232,7 +232,8 @@ pub fn main(init: std.process.Init) !void {
 
     const x_shape = zml.Shape.init(.{ .t = blk.T, .i = blk.D }, .f32);
     const ctx_shape = zml.Shape.init(.{ .t = blk.S, .i = blk.D }, .f32);
-    const ts_shape = zml.Shape.init(.{ .t = blk.T, .n = 9, .i = blk.D }, .f32);
+    const ts_shape = zml.Shape.init(.{ .k = blk.T, .n = 9, .i = blk.D }, .f32); // K=T table (identity index)
+    const tidx_shape = zml.Shape.init(.{ .t = blk.T }, .i32);
     const pts_shape = zml.Shape.init(.{ .n = 2, .i = blk.D }, .f32);
     const pe_shape = zml.Shape.init(.{ .q = blk.T, .h = blk.H, .f = 64 }, .f32);
 
@@ -241,7 +242,11 @@ pub fn main(init: std.process.Init) !void {
     var ctx_buf: zml.Buffer = try .fromBytes(io, platform, ctx_shape, .replicated, std.mem.sliceAsBytes(ctx_h));
     defer ctx_buf.deinit();
     var ts_buf: zml.Buffer = try .fromBytes(io, platform, ts_shape, .replicated, std.mem.sliceAsBytes(ts_h));
+    const tidx_h = try allocator.alloc(i32, Tu);
+    for (tidx_h, 0..) |*v, ii| v.* = @intCast(ii);
+    var tidx_buf: zml.Buffer = try .fromBytes(io, platform, tidx_shape, .replicated, std.mem.sliceAsBytes(tidx_h));
     defer ts_buf.deinit();
+    defer tidx_buf.deinit();
     var pts_buf: zml.Buffer = try .fromBytes(io, platform, pts_shape, .replicated, std.mem.sliceAsBytes(pts_h));
     defer pts_buf.deinit();
     var cos_buf: zml.Buffer = try .fromBytes(io, platform, pe_shape, .replicated, std.mem.sliceAsBytes(cos_thf));
@@ -252,6 +257,7 @@ pub fn main(init: std.process.Init) !void {
     const x_spec: zml.Tensor = .fromShape(x_shape);
     const ctx_spec: zml.Tensor = .fromShape(ctx_shape);
     const ts_spec: zml.Tensor = .fromShape(ts_shape);
+    const tidx_spec: zml.Tensor = .fromShape(tidx_shape);
     const pts_spec: zml.Tensor = .fromShape(pts_shape);
     const cos_spec: zml.Tensor = .fromShape(pe_shape);
     const sin_spec: zml.Tensor = .fromShape(pe_shape);
@@ -264,14 +270,14 @@ pub fn main(init: std.process.Init) !void {
 
     const chain_model: blk.Chain = .{ .b0 = blk.makeBlockSpecs(), .b23 = blk.makeBlockSpecs(), .b47 = blk.makeBlockSpecs() };
     const chain_method = comptime std.meta.stringToEnum(std.meta.DeclEnum(blk.Chain), "chainB47").?;
-    var chain_exe = try platform.compile(allocator, io, chain_model, chain_method, .{ x_spec, ts_spec, ctx_spec, pts_spec, cos_spec, sin_spec }, .{});
+    var chain_exe = try platform.compile(allocator, io, chain_model, chain_method, .{ x_spec, ts_spec, tidx_spec, ctx_spec, pts_spec, cos_spec, sin_spec }, .{});
     inline for (.{ &ring_bufs, &direct_bufs }, .{ got_ring, got_direct }) |bufs3, dst| {
         const cbufs: zml.Bufferized(blk.Chain) = .{ .b0 = bufs3[0], .b23 = bufs3[1], .b47 = bufs3[2] };
         var args = try chain_exe.args(allocator);
         defer args.deinit(allocator);
         var results = try chain_exe.results(allocator);
         defer results.deinit(allocator);
-        args.set(.{ cbufs, x_buf, ts_buf, ctx_buf, pts_buf, cos_buf, sin_buf });
+        args.set(.{ cbufs, x_buf, ts_buf, tidx_buf, ctx_buf, pts_buf, cos_buf, sin_buf });
         chain_exe.call(args, &results);
         var out: zml.Buffer = results.get(zml.Buffer);
         defer out.deinit();
@@ -289,13 +295,13 @@ pub fn main(init: std.process.Init) !void {
         @field(qmodel, qs.field[0..2] ++ "s") = zml.Tensor.fromShape(zml.Shape.init(.{ .o = qs.dims[0], .g = @divExact(qs.dims[1], 128) }, .f32));
     }
     const q_method = comptime std.meta.stringToEnum(std.meta.DeclEnum(blk.QBlock), "qBlockOutAll").?;
-    var q_exe = try platform.compile(allocator, io, qmodel, q_method, .{ x_spec, ts_spec, ctx_spec, pts_spec, cos_spec, sin_spec }, .{});
+    var q_exe = try platform.compile(allocator, io, qmodel, q_method, .{ x_spec, ts_spec, tidx_spec, ctx_spec, pts_spec, cos_spec, sin_spec }, .{});
     inline for (.{ &qbufs_ring, &qbufs_direct }, .{ got_ring, got_direct }) |qb, dst| {
         var args = try q_exe.args(allocator);
         defer args.deinit(allocator);
         var results = try q_exe.results(allocator);
         defer results.deinit(allocator);
-        args.set(.{ qb.*, x_buf, ts_buf, ctx_buf, pts_buf, cos_buf, sin_buf });
+        args.set(.{ qb.*, x_buf, ts_buf, tidx_buf, ctx_buf, pts_buf, cos_buf, sin_buf });
         q_exe.call(args, &results);
         var out: zml.Buffer = results.get(zml.Buffer);
         defer out.deinit();

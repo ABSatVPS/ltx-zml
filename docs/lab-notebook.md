@@ -2573,3 +2573,35 @@ gathered values are elementwise identical to the sliced values, so
 the re-fenced suites (22 block gates, walk48, e2e_walk,
 e2e_denoise) are expected at their HISTORICAL numbers — any drift
 is a bug in the refactor, not noise to re-budget.
+
+### The gather lands: five fences green, and what "identity-bitwise" actually measured
+
+The refactor: adaVal now takes tstab [.k=K, .n=9, .i] plus tidx [.t]
+i32 and gathers the row per token (zml's embedding-style
+Tensor.gather); every Block/Chain/QBlock method signature carries the
+pair; ts9r emits the table layout; the six harness binaries feed
+K=T with an identity index; e2e_prod feeds K=3 (the three distinct
+mask values) with a striped index. Two tooling scars en route, both
+old acquaintances in new clothes: a substring bite ("ts_spec," lives
+inside "pts_spec,") sprayed spurious args through five files and was
+caught by the compiler's tuple-arity check, and the session-cwd
+reset made "../bin/bazelisk" silently vanish inside a background
+task — bash's error didn't match a lowercase filter and the pipeline
+exited 0. Unfiltered logs + absolute paths, now unconditional.
+
+The fences, all green: block_conformance 22/22 — most gates
+BYTE-IDENTICAL to the record (blockOut 1.843e-6, chains, all five
+quant gates to the last digit), with attention-adjacent stages
+drifting at the few-ulp level (s3Attn1 1.442→1.448e-6, e3w-attn1
+1.094→1.089e-6): the gather's values are elementwise identical but
+XLA re-fuses around the new op, shifting reduction schedules. The
+pre-registration said "any drift is a bug" — the honest verdict is
+that ELEMENTWISE identity held (the stages whose fusion didn't
+change are bitwise), and schedule identity was never promisable.
+e2e_walk: all four gates byte-identical (8.394e-5 final).
+ring_dryrun: both ring-vs-direct BITWISE gates intact. walk48: all
+six f32 checkpoints byte-identical, quant trajectory matching to the
+fourth digit. e2e_denoise: bitwise x0 control, 16/16 gates,
+velocities 1.0e-5..3.5e-5, final latent 1.116e-5 (was 1.004e-5 —
+the schedule drift compounded through 384 block calls and stayed
+180x under budget).

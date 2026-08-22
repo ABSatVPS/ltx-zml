@@ -20,6 +20,7 @@ const N_BLOCKS: usize = 48;
 const TP: i64 = 28672; // production tokens (E3's working length)
 const SP: i64 = 32; // harness context length (prompt wiring is Phase 4)
 const SIGMA: f32 = 0.909375;
+const KDIST: i64 = 3; // distinct mask values: 0.0, 0.5, 1.0 (the ts9 gather)
 
 const Tu: usize = @intCast(TP);
 const Su: usize = @intCast(SP);
@@ -82,12 +83,18 @@ fn chunkAgreeGate(allocator: std.mem.Allocator, io: std.Io, platform: *zml.Platf
     }
 
     const x_shape = zml.Shape.init(.{ .t = TG, .i = blk.D }, .f32);
-    const ts_shape = zml.Shape.init(.{ .t = TG, .n = 9, .i = blk.D }, .f32);
+    const ts_shape = zml.Shape.init(.{ .k = TG, .n = 9, .i = blk.D }, .f32); // K=T table (identity index)
+    const tidx_shape = zml.Shape.init(.{ .t = TG }, .i32);
     const pe_shape = zml.Shape.init(.{ .q = TG, .h = blk.H, .f = 64 }, .f32);
     var x_buf: zml.Buffer = try .fromBytes(io, platform, x_shape, .replicated, std.mem.sliceAsBytes(x_h));
     defer x_buf.deinit();
     var ts_buf: zml.Buffer = try .fromBytes(io, platform, ts_shape, .replicated, std.mem.sliceAsBytes(ts_h));
     defer ts_buf.deinit();
+    const tidx_h = try allocator.alloc(i32, TGu);
+    defer allocator.free(tidx_h);
+    for (tidx_h, 0..) |*v, ii| v.* = @intCast(ii);
+    var tidx_buf: zml.Buffer = try .fromBytes(io, platform, tidx_shape, .replicated, std.mem.sliceAsBytes(tidx_h));
+    defer tidx_buf.deinit();
     var cos_buf: zml.Buffer = try .fromBytes(io, platform, pe_shape, .replicated, std.mem.sliceAsBytes(cos_h));
     defer cos_buf.deinit();
     var sin_buf: zml.Buffer = try .fromBytes(io, platform, pe_shape, .replicated, std.mem.sliceAsBytes(sin_h));
@@ -99,6 +106,7 @@ fn chunkAgreeGate(allocator: std.mem.Allocator, io: std.Io, platform: *zml.Platf
     const model = blk.makeBlockSpecs();
     const x_spec: zml.Tensor = .fromShape(x_shape);
     const ts_spec: zml.Tensor = .fromShape(ts_shape);
+    const tidx_spec: zml.Tensor = .fromShape(tidx_shape);
     const cos_spec: zml.Tensor = .fromShape(pe_shape);
     const sin_spec: zml.Tensor = .fromShape(pe_shape);
 
@@ -107,7 +115,7 @@ fn chunkAgreeGate(allocator: std.mem.Allocator, io: std.Io, platform: *zml.Platf
     defer allocator.free(outs[1]);
     inline for (.{ "s3Attn1", "wAttn1" }, 0..) |mname, oi| {
         const method = comptime std.meta.stringToEnum(std.meta.DeclEnum(blk.Block), mname).?;
-        var exe = try platform.compile(allocator, io, model, method, .{ x_spec, ts_spec, cos_spec, sin_spec }, .{});
+        var exe = try platform.compile(allocator, io, model, method, .{ x_spec, ts_spec, tidx_spec, cos_spec, sin_spec }, .{});
         // Release the gate executable before the production pass: run 12
         // localized the latched ResourceExhausted to block 0's FIRST
         // arena allocation retrying past gate leftovers — the failed
@@ -117,7 +125,7 @@ fn chunkAgreeGate(allocator: std.mem.Allocator, io: std.Io, platform: *zml.Platf
         defer args.deinit(allocator);
         var results = try exe.results(allocator);
         defer results.deinit(allocator);
-        args.set(.{ bufs, x_buf, ts_buf, cos_buf, sin_buf });
+        args.set(.{ bufs, x_buf, ts_buf, tidx_buf, cos_buf, sin_buf });
         exe.call(args, &results);
         var out: zml.Buffer = results.get(zml.Buffer);
         defer out.deinit();
@@ -210,6 +218,10 @@ pub fn main(init: std.process.Init) !void {
         const m: f32 = if (i < 4096) 0.0 else if (i < 8192) 0.5 else 1.0;
         x.* = m * SIGMA;
     }
+    // the K=3 distinct rows + per-token index (same arithmetic per value)
+    const t3_h = [_]f32{ 0.0 * SIGMA, 0.5 * SIGMA, 1.0 * SIGMA };
+    const tidx_h = try allocator.alloc(i32, Tu);
+    for (tidx_h, 0..) |*v, i| v.* = if (i < 4096) 0 else if (i < 8192) 1 else 2;
     const sg_h = [_]f32{SIGMA};
     const ctx_h = try allocator.alloc(f32, Su * Du);
     for (ctx_h) |*x| x.* = (rnd.float(f32) - 0.5) * 1.4;
@@ -228,7 +240,9 @@ pub fn main(init: std.process.Init) !void {
     const sg_shape = zml.Shape.init(.{ .t = 1 }, .f32);
     const x_shape = zml.Shape.init(.{ .t = TP, .i = blk.D }, .f32);
     const ctx_shape = zml.Shape.init(.{ .t = SP, .i = blk.D }, .f32);
-    const ts_shape = zml.Shape.init(.{ .t = TP, .n = 9, .i = blk.D }, .f32);
+    const ts_shape = zml.Shape.init(.{ .k = KDIST, .n = 9, .i = blk.D }, .f32); // the ts9 gather: K distinct rows
+    const tidx_shape = zml.Shape.init(.{ .t = TP }, .i32);
+    const t3_shape = zml.Shape.init(.{ .t = KDIST }, .f32);
     const pts_shape = zml.Shape.init(.{ .n = 2, .i = blk.D }, .f32);
     const pe_shape = zml.Shape.init(.{ .q = TP, .h = blk.H, .f = 64 }, .f32);
 
@@ -236,6 +250,10 @@ pub fn main(init: std.process.Init) !void {
     defer lat_buf.deinit();
     var t_buf: zml.Buffer = try .fromBytes(io, platform, t_shape, .replicated, std.mem.sliceAsBytes(t_h));
     defer t_buf.deinit();
+    var t3_buf: zml.Buffer = try .fromBytes(io, platform, t3_shape, .replicated, std.mem.sliceAsBytes(&t3_h));
+    defer t3_buf.deinit();
+    var tidx_buf: zml.Buffer = try .fromBytes(io, platform, tidx_shape, .replicated, std.mem.sliceAsBytes(tidx_h));
+    defer tidx_buf.deinit();
     var sg_buf: zml.Buffer = try .fromBytes(io, platform, sg_shape, .replicated, std.mem.sliceAsBytes(&sg_h));
     defer sg_buf.deinit();
     var ctx_buf: zml.Buffer = try .fromBytes(io, platform, ctx_shape, .replicated, std.mem.sliceAsBytes(ctx_h));
@@ -248,6 +266,8 @@ pub fn main(init: std.process.Init) !void {
     allocator.free(sin_h);
 
     const lat_spec: zml.Tensor = .fromShape(lat_shape);
+    const t3_spec: zml.Tensor = .fromShape(t3_shape);
+    const tidx_spec: zml.Tensor = .fromShape(tidx_shape);
     const t_spec: zml.Tensor = .fromShape(t_shape);
     const sg_spec: zml.Tensor = .fromShape(sg_shape);
     const x_spec: zml.Tensor = .fromShape(x_shape);
@@ -267,7 +287,7 @@ pub fn main(init: std.process.Init) !void {
     const emb_m = comptime std.meta.stringToEnum(std.meta.DeclEnum(core.CoreParts), "emb").?;
     const tail_m = comptime std.meta.stringToEnum(std.meta.DeclEnum(core.CoreParts), "tailFromEmb").?;
     var patchify_exe = try platform.compile(allocator, io, cmodel, patchify_m, .{lat_spec}, .{});
-    var ts9r_exe = try platform.compile(allocator, io, cmodel, ts9r_m, .{t_spec}, .{});
+    var ts9r_exe = try platform.compile(allocator, io, cmodel, ts9r_m, .{t3_spec}, .{});
     var pts2r_exe = try platform.compile(allocator, io, cmodel, pts2r_m, .{sg_spec}, .{});
     var emb_exe = try platform.compile(allocator, io, cmodel, emb_m, .{t_spec}, .{});
     var tail_exe = try platform.compile(allocator, io, cmodel, tail_m, .{ x_spec, zml.Tensor.fromShape(x_shape) }, .{});
@@ -276,7 +296,7 @@ pub fn main(init: std.process.Init) !void {
     var vstats_exe = try platform.compile(allocator, io, cmodel, vstats_m, .{zml.Tensor.fromShape(vel_shape)}, .{});
     const model = blk.makeBlockSpecs();
     const wblk_m = comptime std.meta.stringToEnum(std.meta.DeclEnum(blk.Block), "wBlockOut").?;
-    var blk_exe = try platform.compile(allocator, io, model, wblk_m, .{ x_spec, ts_spec, ctx_spec, pts_spec, cos_spec, sin_spec }, .{});
+    var blk_exe = try platform.compile(allocator, io, model, wblk_m, .{ x_spec, ts_spec, tidx_spec, ctx_spec, pts_spec, cos_spec, sin_spec }, .{});
     log.info("7 executables compiled at T={d} in {d:.1} s", .{ TP, @as(f64, @floatFromInt(@as(u64, @intCast(nowNs(io) - compile_t0)))) / 1e9 });
 
     // emb once, resident for the whole pass (470 MB) — the tail takes it
@@ -326,7 +346,7 @@ pub fn main(init: std.process.Init) !void {
         defer args.deinit(allocator);
         var results = try ts9r_exe.results(allocator);
         defer results.deinit(allocator);
-        args.set(.{ cbufs, t_buf });
+        args.set(.{ cbufs, t3_buf });
         ts9r_exe.call(args, &results);
         ts_buf = results.get(zml.Buffer);
         try ts_buf.await(io);
@@ -366,7 +386,7 @@ pub fn main(init: std.process.Init) !void {
             const blob = &ring.blobs[pos];
             var bufs = try ldr.buildBlockBufs(io, platform, blob, slot.mem, @intCast(pos));
             ring.release(io, slot);
-            args.set(.{ bufs, x_cur, ts_buf, ctx_buf, pts_buf, cos_buf, sin_buf });
+            args.set(.{ bufs, x_cur, ts_buf, tidx_buf, ctx_buf, pts_buf, cos_buf, sin_buf });
             blk_exe.call(args, &results);
             var out: zml.Buffer = results.get(zml.Buffer);
             try out.await(io);

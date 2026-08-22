@@ -268,7 +268,8 @@ pub fn main(init: std.process.Init) !void {
 
     const x_shape = zml.Shape.init(.{ .t = T, .i = D }, .f32);
     const ctx_shape = zml.Shape.init(.{ .t = S, .i = D }, .f32);
-    const ts_shape = zml.Shape.init(.{ .t = T, .n = 9, .i = D }, .f32);
+    const ts_shape = zml.Shape.init(.{ .k = T, .n = 9, .i = D }, .f32); // K=T table (identity index)
+    const tidx_shape = zml.Shape.init(.{ .t = T }, .i32);
     const pts_shape = zml.Shape.init(.{ .n = 2, .i = D }, .f32);
     const pe_shape = zml.Shape.init(.{ .q = T, .h = H, .f = 64 }, .f32);
 
@@ -277,7 +278,11 @@ pub fn main(init: std.process.Init) !void {
     var ctx_buf: zml.Buffer = try .fromBytes(io, platform, ctx_shape, .replicated, std.mem.sliceAsBytes(ctx_h));
     defer ctx_buf.deinit();
     var ts_buf: zml.Buffer = try .fromBytes(io, platform, ts_shape, .replicated, std.mem.sliceAsBytes(ts_h));
+    const tidx_h = try allocator.alloc(i32, Tu);
+    for (tidx_h, 0..) |*v, ii| v.* = @intCast(ii);
+    var tidx_buf: zml.Buffer = try .fromBytes(io, platform, tidx_shape, .replicated, std.mem.sliceAsBytes(tidx_h));
     defer ts_buf.deinit();
+    defer tidx_buf.deinit();
     var pts_buf: zml.Buffer = try .fromBytes(io, platform, pts_shape, .replicated, std.mem.sliceAsBytes(pts_h));
     defer pts_buf.deinit();
     var cos_buf: zml.Buffer = try .fromBytes(io, platform, pe_shape, .replicated, std.mem.sliceAsBytes(cos_thf));
@@ -288,6 +293,7 @@ pub fn main(init: std.process.Init) !void {
     const x_spec: zml.Tensor = .fromShape(x_shape);
     const ctx_spec: zml.Tensor = .fromShape(ctx_shape);
     const ts_spec: zml.Tensor = .fromShape(ts_shape);
+    const tidx_spec: zml.Tensor = .fromShape(tidx_shape);
     const pts_spec: zml.Tensor = .fromShape(pts_shape);
     const cos_spec: zml.Tensor = .fromShape(pe_shape);
     const sin_spec: zml.Tensor = .fromShape(pe_shape);
@@ -318,18 +324,18 @@ pub fn main(init: std.process.Init) !void {
     inline for (stages) |st| {
         const method = comptime std.meta.stringToEnum(std.meta.DeclEnum(Block), st.method).?;
         var exe = switch (st.args) {
-            .xt => try platform.compile(allocator, io, model, method, .{ x_spec, ts_spec }, .{}),
-            .xtcs => try platform.compile(allocator, io, model, method, .{ x_spec, ts_spec, cos_spec, sin_spec }, .{}),
-            .full => try platform.compile(allocator, io, model, method, .{ x_spec, ts_spec, ctx_spec, pts_spec, cos_spec, sin_spec }, .{}),
+            .xt => try platform.compile(allocator, io, model, method, .{ x_spec, ts_spec, tidx_spec }, .{}),
+            .xtcs => try platform.compile(allocator, io, model, method, .{ x_spec, ts_spec, tidx_spec, cos_spec, sin_spec }, .{}),
+            .full => try platform.compile(allocator, io, model, method, .{ x_spec, ts_spec, tidx_spec, ctx_spec, pts_spec, cos_spec, sin_spec }, .{}),
         };
         var args = try exe.args(allocator);
         defer args.deinit(allocator);
         var results = try exe.results(allocator);
         defer results.deinit(allocator);
         switch (st.args) {
-            .xt => args.set(.{ bufs, x_buf, ts_buf }),
-            .xtcs => args.set(.{ bufs, x_buf, ts_buf, cos_buf, sin_buf }),
-            .full => args.set(.{ bufs, x_buf, ts_buf, ctx_buf, pts_buf, cos_buf, sin_buf }),
+            .xt => args.set(.{ bufs, x_buf, ts_buf, tidx_buf }),
+            .xtcs => args.set(.{ bufs, x_buf, ts_buf, tidx_buf, cos_buf, sin_buf }),
+            .full => args.set(.{ bufs, x_buf, ts_buf, tidx_buf, ctx_buf, pts_buf, cos_buf, sin_buf }),
         }
         exe.call(args, &results);
         var out: zml.Buffer = results.get(zml.Buffer);
@@ -356,12 +362,12 @@ pub fn main(init: std.process.Init) !void {
     };
     inline for (chain_stages) |st| {
         const method = comptime std.meta.stringToEnum(std.meta.DeclEnum(Chain), st.method).?;
-        var exe = try platform.compile(allocator, io, chain_model, method, .{ x_spec, ts_spec, ctx_spec, pts_spec, cos_spec, sin_spec }, .{});
+        var exe = try platform.compile(allocator, io, chain_model, method, .{ x_spec, ts_spec, tidx_spec, ctx_spec, pts_spec, cos_spec, sin_spec }, .{});
         var args = try exe.args(allocator);
         defer args.deinit(allocator);
         var results = try exe.results(allocator);
         defer results.deinit(allocator);
-        args.set(.{ cbufs, x_buf, ts_buf, ctx_buf, pts_buf, cos_buf, sin_buf });
+        args.set(.{ cbufs, x_buf, ts_buf, tidx_buf, ctx_buf, pts_buf, cos_buf, sin_buf });
         exe.call(args, &results);
         var out: zml.Buffer = results.get(zml.Buffer);
         defer out.deinit();
@@ -384,12 +390,12 @@ pub fn main(init: std.process.Init) !void {
         defer allocator.free(dense_attn);
         inline for (.{ "s3Attn1", "wAttn1" }, .{ dense_attn, got }) |mname, dst| {
             const method = comptime std.meta.stringToEnum(std.meta.DeclEnum(Block), mname).?;
-            var exe = try platform.compile(allocator, io, model, method, .{ x_spec, ts_spec, cos_spec, sin_spec }, .{});
+            var exe = try platform.compile(allocator, io, model, method, .{ x_spec, ts_spec, tidx_spec, cos_spec, sin_spec }, .{});
             var args = try exe.args(allocator);
             defer args.deinit(allocator);
             var results = try exe.results(allocator);
             defer results.deinit(allocator);
-            args.set(.{ bufs, x_buf, ts_buf, cos_buf, sin_buf });
+            args.set(.{ bufs, x_buf, ts_buf, tidx_buf, cos_buf, sin_buf });
             exe.call(args, &results);
             var out: zml.Buffer = results.get(zml.Buffer);
             defer out.deinit();
@@ -401,12 +407,12 @@ pub fn main(init: std.process.Init) !void {
     }
     {
         const wmethod = comptime std.meta.stringToEnum(std.meta.DeclEnum(Block), "wBlockOut").?;
-        var exe = try platform.compile(allocator, io, model, wmethod, .{ x_spec, ts_spec, ctx_spec, pts_spec, cos_spec, sin_spec }, .{});
+        var exe = try platform.compile(allocator, io, model, wmethod, .{ x_spec, ts_spec, tidx_spec, ctx_spec, pts_spec, cos_spec, sin_spec }, .{});
         var args = try exe.args(allocator);
         defer args.deinit(allocator);
         var results = try exe.results(allocator);
         defer results.deinit(allocator);
-        args.set(.{ bufs, x_buf, ts_buf, ctx_buf, pts_buf, cos_buf, sin_buf });
+        args.set(.{ bufs, x_buf, ts_buf, tidx_buf, ctx_buf, pts_buf, cos_buf, sin_buf });
         exe.call(args, &results);
         var out: zml.Buffer = results.get(zml.Buffer);
         defer out.deinit();
@@ -419,12 +425,12 @@ pub fn main(init: std.process.Init) !void {
     }
     {
         const wmethod = comptime std.meta.stringToEnum(std.meta.DeclEnum(Chain), "wChainB47").?;
-        var exe = try platform.compile(allocator, io, chain_model, wmethod, .{ x_spec, ts_spec, ctx_spec, pts_spec, cos_spec, sin_spec }, .{});
+        var exe = try platform.compile(allocator, io, chain_model, wmethod, .{ x_spec, ts_spec, tidx_spec, ctx_spec, pts_spec, cos_spec, sin_spec }, .{});
         var args = try exe.args(allocator);
         defer args.deinit(allocator);
         var results = try exe.results(allocator);
         defer results.deinit(allocator);
-        args.set(.{ cbufs, x_buf, ts_buf, ctx_buf, pts_buf, cos_buf, sin_buf });
+        args.set(.{ cbufs, x_buf, ts_buf, tidx_buf, ctx_buf, pts_buf, cos_buf, sin_buf });
         exe.call(args, &results);
         var out: zml.Buffer = results.get(zml.Buffer);
         defer out.deinit();
@@ -495,14 +501,14 @@ pub fn main(init: std.process.Init) !void {
         // f32 baseline
         {
             var exe = if (p.full)
-                try platform.compile(allocator, io, model, fmethod, .{ x_spec, ts_spec, ctx_spec, pts_spec, cos_spec, sin_spec }, .{})
+                try platform.compile(allocator, io, model, fmethod, .{ x_spec, ts_spec, tidx_spec, ctx_spec, pts_spec, cos_spec, sin_spec }, .{})
             else
-                try platform.compile(allocator, io, model, fmethod, .{ x_spec, ts_spec, cos_spec, sin_spec }, .{});
+                try platform.compile(allocator, io, model, fmethod, .{ x_spec, ts_spec, tidx_spec, cos_spec, sin_spec }, .{});
             var args = try exe.args(allocator);
             defer args.deinit(allocator);
             var results = try exe.results(allocator);
             defer results.deinit(allocator);
-            if (p.full) args.set(.{ bufs, x_buf, ts_buf, ctx_buf, pts_buf, cos_buf, sin_buf }) else args.set(.{ bufs, x_buf, ts_buf, cos_buf, sin_buf });
+            if (p.full) args.set(.{ bufs, x_buf, ts_buf, tidx_buf, ctx_buf, pts_buf, cos_buf, sin_buf }) else args.set(.{ bufs, x_buf, ts_buf, tidx_buf, cos_buf, sin_buf });
             exe.call(args, &results);
             var out: zml.Buffer = results.get(zml.Buffer);
             defer out.deinit();
@@ -517,14 +523,14 @@ pub fn main(init: std.process.Init) !void {
         @memcpy(ref_copy, ref_buf[0..p.len]);
         {
             var exe = if (p.full)
-                try platform.compile(allocator, io, qmodel, qmethod, .{ x_spec, ts_spec, ctx_spec, pts_spec, cos_spec, sin_spec }, .{})
+                try platform.compile(allocator, io, qmodel, qmethod, .{ x_spec, ts_spec, tidx_spec, ctx_spec, pts_spec, cos_spec, sin_spec }, .{})
             else
-                try platform.compile(allocator, io, qmodel, qmethod, .{ x_spec, ts_spec, cos_spec, sin_spec }, .{});
+                try platform.compile(allocator, io, qmodel, qmethod, .{ x_spec, ts_spec, tidx_spec, cos_spec, sin_spec }, .{});
             var args = try exe.args(allocator);
             defer args.deinit(allocator);
             var results = try exe.results(allocator);
             defer results.deinit(allocator);
-            if (p.full) args.set(.{ qbufs, x_buf, ts_buf, ctx_buf, pts_buf, cos_buf, sin_buf }) else args.set(.{ qbufs, x_buf, ts_buf, cos_buf, sin_buf });
+            if (p.full) args.set(.{ qbufs, x_buf, ts_buf, tidx_buf, ctx_buf, pts_buf, cos_buf, sin_buf }) else args.set(.{ qbufs, x_buf, ts_buf, tidx_buf, cos_buf, sin_buf });
             exe.call(args, &results);
             var out: zml.Buffer = results.get(zml.Buffer);
             defer out.deinit();

@@ -140,7 +140,8 @@ pub fn main(init: std.process.Init) !void {
     const sg_shape = zml.Shape.init(.{ .t = 1 }, .f32);
     const x_shape = zml.Shape.init(.{ .t = blk.T, .i = blk.D }, .f32);
     const ctx_shape = zml.Shape.init(.{ .t = blk.S, .i = blk.D }, .f32);
-    const ts_shape = zml.Shape.init(.{ .t = blk.T, .n = 9, .i = blk.D }, .f32);
+    const ts_shape = zml.Shape.init(.{ .k = blk.T, .n = 9, .i = blk.D }, .f32); // K=T table (identity index)
+    const tidx_shape = zml.Shape.init(.{ .t = blk.T }, .i32);
     const pts_shape = zml.Shape.init(.{ .n = 2, .i = blk.D }, .f32);
     const pe_shape = zml.Shape.init(.{ .q = blk.T, .h = blk.H, .f = 64 }, .f32);
 
@@ -156,6 +157,10 @@ pub fn main(init: std.process.Init) !void {
     defer cos_buf.deinit();
     var sin_buf: zml.Buffer = try .fromBytes(io, platform, pe_shape, .replicated, std.mem.sliceAsBytes(sin_thf));
     defer sin_buf.deinit();
+    const tidx_h = try allocator.alloc(i32, Tu);
+    for (tidx_h, 0..) |*v, ii| v.* = @intCast(ii);
+    var tidx_buf: zml.Buffer = try .fromBytes(io, platform, tidx_shape, .replicated, std.mem.sliceAsBytes(tidx_h));
+    defer tidx_buf.deinit();
 
     const lat_spec: zml.Tensor = .fromShape(lat_shape);
     const t_spec: zml.Tensor = .fromShape(t_shape);
@@ -163,6 +168,7 @@ pub fn main(init: std.process.Init) !void {
     const x_spec: zml.Tensor = .fromShape(x_shape);
     const ctx_spec: zml.Tensor = .fromShape(ctx_shape);
     const ts_spec: zml.Tensor = .fromShape(ts_shape);
+    const tidx_spec: zml.Tensor = .fromShape(tidx_shape);
     const pts_spec: zml.Tensor = .fromShape(pts_shape);
     const cos_spec: zml.Tensor = .fromShape(pe_shape);
     const sin_spec: zml.Tensor = .fromShape(pe_shape);
@@ -181,7 +187,7 @@ pub fn main(init: std.process.Init) !void {
 
     const model = blk.makeBlockSpecs();
     const blk_m = comptime std.meta.stringToEnum(std.meta.DeclEnum(blk.Block), "blockOut").?;
-    var blk_exe = try platform.compile(allocator, io, model, blk_m, .{ x_spec, ts_spec, ctx_spec, pts_spec, cos_spec, sin_spec }, .{});
+    var blk_exe = try platform.compile(allocator, io, model, blk_m, .{ x_spec, ts_spec, tidx_spec, ctx_spec, pts_spec, cos_spec, sin_spec }, .{});
     log.info("5 executables compiled (patchify, ts9r, pts2r, tail, block)", .{});
 
     var all_pass = true;
@@ -256,7 +262,7 @@ pub fn main(init: std.process.Init) !void {
             var bufs = try ldr.buildBlockBufs(io, platform, blob, slot.mem, @intCast(pos));
             ring.release(io, slot);
 
-            args.set(.{ bufs, x_cur, ts_buf, ctx_buf, pts_buf, cos_buf, sin_buf });
+            args.set(.{ bufs, x_cur, ts_buf, tidx_buf, ctx_buf, pts_buf, cos_buf, sin_buf });
             blk_exe.call(args, &results);
             var out: zml.Buffer = results.get(zml.Buffer);
 

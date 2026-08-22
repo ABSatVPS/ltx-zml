@@ -122,19 +122,24 @@ pub fn main(init: std.process.Init) !void {
 
     const x_shape = zml.Shape.init(.{ .t = blk.T, .i = blk.D }, .f32);
     const ctx_shape = zml.Shape.init(.{ .t = blk.S, .i = blk.D }, .f32);
-    const ts_shape = zml.Shape.init(.{ .t = blk.T, .n = 9, .i = blk.D }, .f32);
+    const ts_shape = zml.Shape.init(.{ .k = blk.T, .n = 9, .i = blk.D }, .f32); // K=T table (identity index)
+    const tidx_shape = zml.Shape.init(.{ .t = blk.T }, .i32);
     const pts_shape = zml.Shape.init(.{ .n = 2, .i = blk.D }, .f32);
     const pe_shape = zml.Shape.init(.{ .q = blk.T, .h = blk.H, .f = 64 }, .f32);
 
     var x_buf0: zml.Buffer = try .fromBytes(io, platform, x_shape, .replicated, std.mem.sliceAsBytes(x_h));
     var ctx_buf: zml.Buffer = try .fromBytes(io, platform, ctx_shape, .replicated, std.mem.sliceAsBytes(ctx_h));
     var ts_buf: zml.Buffer = try .fromBytes(io, platform, ts_shape, .replicated, std.mem.sliceAsBytes(ts_h));
+    const tidx_h = try allocator.alloc(i32, Tu);
+    for (tidx_h, 0..) |*v, ii| v.* = @intCast(ii);
+    var tidx_buf: zml.Buffer = try .fromBytes(io, platform, tidx_shape, .replicated, std.mem.sliceAsBytes(tidx_h));
     var pts_buf: zml.Buffer = try .fromBytes(io, platform, pts_shape, .replicated, std.mem.sliceAsBytes(pts_h));
     var cos_buf: zml.Buffer = try .fromBytes(io, platform, pe_shape, .replicated, std.mem.sliceAsBytes(cos_thf));
     var sin_buf: zml.Buffer = try .fromBytes(io, platform, pe_shape, .replicated, std.mem.sliceAsBytes(sin_thf));
     defer x_buf0.deinit();
     defer ctx_buf.deinit();
     defer ts_buf.deinit();
+    defer tidx_buf.deinit();
     defer pts_buf.deinit();
     defer cos_buf.deinit();
     defer sin_buf.deinit();
@@ -142,6 +147,7 @@ pub fn main(init: std.process.Init) !void {
     const x_spec: zml.Tensor = .fromShape(x_shape);
     const ctx_spec: zml.Tensor = .fromShape(ctx_shape);
     const ts_spec: zml.Tensor = .fromShape(ts_shape);
+    const tidx_spec: zml.Tensor = .fromShape(tidx_shape);
     const pts_spec: zml.Tensor = .fromShape(pts_shape);
     const cos_spec: zml.Tensor = .fromShape(pe_shape);
     const sin_spec: zml.Tensor = .fromShape(pe_shape);
@@ -161,7 +167,7 @@ pub fn main(init: std.process.Init) !void {
     // ---- ONE block executable each for f32 and quant ----------------------
     const model = blk.makeBlockSpecs();
     const f32_method = comptime std.meta.stringToEnum(std.meta.DeclEnum(blk.Block), "blockOut").?;
-    var f32_exe = try platform.compile(allocator, io, model, f32_method, .{ x_spec, ts_spec, ctx_spec, pts_spec, cos_spec, sin_spec }, .{});
+    var f32_exe = try platform.compile(allocator, io, model, f32_method, .{ x_spec, ts_spec, tidx_spec, ctx_spec, pts_spec, cos_spec, sin_spec }, .{});
 
     var qmodel: blk.QBlock = undefined;
     qmodel.base = blk.makeBlockSpecs();
@@ -170,7 +176,7 @@ pub fn main(init: std.process.Init) !void {
         @field(qmodel, qs.field[0..2] ++ "s") = zml.Tensor.fromShape(zml.Shape.init(.{ .o = qs.dims[0], .g = @divExact(qs.dims[1], 128) }, .f32));
     }
     const q_method = comptime std.meta.stringToEnum(std.meta.DeclEnum(blk.QBlock), "qBlockOutAll").?;
-    var q_exe = try platform.compile(allocator, io, qmodel, q_method, .{ x_spec, ts_spec, ctx_spec, pts_spec, cos_spec, sin_spec }, .{});
+    var q_exe = try platform.compile(allocator, io, qmodel, q_method, .{ x_spec, ts_spec, tidx_spec, ctx_spec, pts_spec, cos_spec, sin_spec }, .{});
     log.info("block executables compiled (f32 + quant), reused across all 48 calls", .{});
 
     var schedule: [N_BLOCKS]usize = undefined;
@@ -217,7 +223,7 @@ pub fn main(init: std.process.Init) !void {
             upload_ns += @intCast(nowNs(io) - tu0);
             ring.release(io, slot);
 
-            if (quant) args.set(.{ qbufs, x_cur, ts_buf, ctx_buf, pts_buf, cos_buf, sin_buf }) else args.set(.{ bufs, x_cur, ts_buf, ctx_buf, pts_buf, cos_buf, sin_buf });
+            if (quant) args.set(.{ qbufs, x_cur, ts_buf, tidx_buf, ctx_buf, pts_buf, cos_buf, sin_buf }) else args.set(.{ bufs, x_cur, ts_buf, tidx_buf, ctx_buf, pts_buf, cos_buf, sin_buf });
             const tc0 = nowNs(io);
             if (quant) q_exe.call(args, &results) else f32_exe.call(args, &results);
             var out: zml.Buffer = results.get(zml.Buffer);

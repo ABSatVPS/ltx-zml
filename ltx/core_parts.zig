@@ -127,9 +127,12 @@ pub const CoreParts = struct {
         return lin(silu(e), self.pada_out_w, self.pada_out_b);
     }
 
-    /// ts9 in the block executable's input layout [.t, .n=9, .i=D].
+    /// ts9 in the block executable's TABLE layout [.k=K, .n=9, .i=D] —
+    /// the ts9 gather contract (notebook 2026-08-22). Fed the full
+    /// per-token t at harness (K=T, identity index) or just the distinct
+    /// mask values at production (K=#distinct).
     pub fn ts9r(self: @This(), t: zml.Tensor) zml.Tensor {
-        return self.ts9(t).splitAxis(.i, .{ .n = 9, .i = D });
+        return self.ts9(t).splitAxis(.i, .{ .n = 9, .i = D }).withTags(.{ .k, .n, .i });
     }
 
     /// pts2 in the block executable's input layout [.n=2, .i=D].

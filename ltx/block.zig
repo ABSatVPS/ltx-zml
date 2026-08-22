@@ -37,11 +37,16 @@ pub fn modulate(n: zml.Tensor, scale: zml.Tensor, shift: zml.Tensor) zml.Tensor 
     return n.mul(scale.addConstant(1.0)).add(shift);
 }
 
-/// ada value i: per-block table row + per-token timestep chunk. ts3 is
-/// [.t, .n=9, .i], table [.n, .i].
-pub fn adaVal(table: zml.Tensor, ts3: zml.Tensor, i: i64) zml.Tensor {
+/// ada value i: per-block table row + per-token timestep chunk, GATHERED
+/// from the K-row timestep table by per-token index (the ts9 gather,
+/// notebook 2026-08-22): tstab [.k=K, .n=9, .i], tidx [.t] i32, table
+/// [.n, .i]. Harness runs K=T with an identity index — elementwise
+/// identical to the pre-gather [.t,.n,.i] contract — production runs
+/// K = #distinct mask values (a full [T,9,D] ts9 cannot be resident at
+/// T=28,672: it is why block 0's arena never fit on the first attempt).
+pub fn adaVal(table: zml.Tensor, tstab: zml.Tensor, tidx: zml.Tensor, i: i64) zml.Tensor {
     const row = table.convert(.f32).slice1d(.n, .{ .start = i, .end = i + 1 }).squeeze(.n); // [.i]
-    const tv = ts3.slice1d(.n, .{ .start = i, .end = i + 1 }).squeeze(.n); // [.t,.i]
+    const tv = tstab.slice1d(.n, .{ .start = i, .end = i + 1 }).squeeze(.n).gather(.{ .k = tidx }, .{}); // [.t,.i]
     return tv.add(row.broad(tv.shape()));
 }
 
@@ -224,53 +229,53 @@ pub const Block = struct {
 
     // ---- stages, each recomputing its prefix (pre-registered order) ----
 
-    pub fn s1NormMsa(self: @This(), x: zml.Tensor, ts3: zml.Tensor) zml.Tensor {
-        const shift = adaVal(self.sst, ts3, 0);
-        const scl = adaVal(self.sst, ts3, 1);
+    pub fn s1NormMsa(self: @This(), x: zml.Tensor, tstab: zml.Tensor, tidx: zml.Tensor) zml.Tensor {
+        const shift = adaVal(self.sst, tstab, tidx, 0);
+        const scl = adaVal(self.sst, tstab, tidx, 1);
         return modulate(rmsNoW(x), scl, shift);
     }
 
-    pub fn s1bQnorm(self: @This(), x: zml.Tensor, ts3: zml.Tensor) zml.Tensor {
-        const n = self.s1NormMsa(x, ts3);
+    pub fn s1bQnorm(self: @This(), x: zml.Tensor, tstab: zml.Tensor, tidx: zml.Tensor) zml.Tensor {
+        const n = self.s1NormMsa(x, tstab, tidx);
         return rmsW(lin(n, self.q1_w, self.q1_b), self.qn1);
     }
 
-    pub fn s2Attn1NoGate(self: @This(), x: zml.Tensor, ts3: zml.Tensor, cos: zml.Tensor, sin: zml.Tensor) zml.Tensor {
-        const n = self.s1NormMsa(x, ts3);
+    pub fn s2Attn1NoGate(self: @This(), x: zml.Tensor, tstab: zml.Tensor, tidx: zml.Tensor, cos: zml.Tensor, sin: zml.Tensor) zml.Tensor {
+        const n = self.s1NormMsa(x, tstab, tidx);
         return attention(self.attn1w(), n, n, n.dim(.t), .{ .cos = cos, .sin = sin }, false, .dense);
     }
 
-    fn attn1Out(self: @This(), x: zml.Tensor, ts3: zml.Tensor, cos: zml.Tensor, sin: zml.Tensor, comptime algo: Algo) zml.Tensor {
-        const n = self.s1NormMsa(x, ts3);
+    fn attn1Out(self: @This(), x: zml.Tensor, tstab: zml.Tensor, tidx: zml.Tensor, cos: zml.Tensor, sin: zml.Tensor, comptime algo: Algo) zml.Tensor {
+        const n = self.s1NormMsa(x, tstab, tidx);
         return attention(self.attn1w(), n, n, n.dim(.t), .{ .cos = cos, .sin = sin }, true, algo);
     }
 
-    pub fn s3Attn1(self: @This(), x: zml.Tensor, ts3: zml.Tensor, cos: zml.Tensor, sin: zml.Tensor) zml.Tensor {
-        return self.attn1Out(x, ts3, cos, sin, .dense);
+    pub fn s3Attn1(self: @This(), x: zml.Tensor, tstab: zml.Tensor, tidx: zml.Tensor, cos: zml.Tensor, sin: zml.Tensor) zml.Tensor {
+        return self.attn1Out(x, tstab, tidx, cos, sin, .dense);
     }
 
     /// E3w agreement probe: gated attn1 through the while kernel.
-    pub fn wAttn1(self: @This(), x: zml.Tensor, ts3: zml.Tensor, cos: zml.Tensor, sin: zml.Tensor) zml.Tensor {
-        return self.attn1Out(x, ts3, cos, sin, .blockwise);
+    pub fn wAttn1(self: @This(), x: zml.Tensor, tstab: zml.Tensor, tidx: zml.Tensor, cos: zml.Tensor, sin: zml.Tensor) zml.Tensor {
+        return self.attn1Out(x, tstab, tidx, cos, sin, .blockwise);
     }
 
-    fn afterSa(self: @This(), x: zml.Tensor, ts3: zml.Tensor, cos: zml.Tensor, sin: zml.Tensor, comptime algo: Algo) zml.Tensor {
-        const gate = adaVal(self.sst, ts3, 2);
-        return x.add(self.attn1Out(x, ts3, cos, sin, algo).mul(gate));
+    fn afterSa(self: @This(), x: zml.Tensor, tstab: zml.Tensor, tidx: zml.Tensor, cos: zml.Tensor, sin: zml.Tensor, comptime algo: Algo) zml.Tensor {
+        const gate = adaVal(self.sst, tstab, tidx, 2);
+        return x.add(self.attn1Out(x, tstab, tidx, cos, sin, algo).mul(gate));
     }
 
-    pub fn s4AfterSa(self: @This(), x: zml.Tensor, ts3: zml.Tensor, cos: zml.Tensor, sin: zml.Tensor) zml.Tensor {
-        return self.afterSa(x, ts3, cos, sin, .dense);
+    pub fn s4AfterSa(self: @This(), x: zml.Tensor, tstab: zml.Tensor, tidx: zml.Tensor, cos: zml.Tensor, sin: zml.Tensor) zml.Tensor {
+        return self.afterSa(x, tstab, tidx, cos, sin, .dense);
     }
 
-    pub fn s4Normed(self: @This(), x: zml.Tensor, ts3: zml.Tensor, cos: zml.Tensor, sin: zml.Tensor) zml.Tensor {
-        return rmsNoW(self.afterSa(x, ts3, cos, sin, .dense));
+    pub fn s4Normed(self: @This(), x: zml.Tensor, tstab: zml.Tensor, tidx: zml.Tensor, cos: zml.Tensor, sin: zml.Tensor) zml.Tensor {
+        return rmsNoW(self.afterSa(x, tstab, tidx, cos, sin, .dense));
     }
 
-    fn caOut(self: @This(), x_normed: zml.Tensor, ts3: zml.Tensor, ctx: zml.Tensor, pts2: zml.Tensor) zml.Tensor {
-        const shift_q = adaVal(self.sst, ts3, 6);
-        const scale_q = adaVal(self.sst, ts3, 7);
-        const gate_ca = adaVal(self.sst, ts3, 8);
+    fn caOut(self: @This(), x_normed: zml.Tensor, tstab: zml.Tensor, tidx: zml.Tensor, ctx: zml.Tensor, pts2: zml.Tensor) zml.Tensor {
+        const shift_q = adaVal(self.sst, tstab, tidx, 6);
+        const scale_q = adaVal(self.sst, tstab, tidx, 7);
+        const gate_ca = adaVal(self.sst, tstab, tidx, 8);
         const attn_in = modulate(x_normed, scale_q, shift_q);
         // K/V modulation: per-block prompt table + prompt timestep, rows
         // (shift, scale).
@@ -284,56 +289,56 @@ pub const Block = struct {
         return ca.mul(gate_ca);
     }
 
-    fn s5CaOutA(self: @This(), x: zml.Tensor, ts3: zml.Tensor, ctx: zml.Tensor, pts2: zml.Tensor, cos: zml.Tensor, sin: zml.Tensor, comptime algo: Algo) zml.Tensor {
-        return self.caOut(rmsNoW(self.afterSa(x, ts3, cos, sin, algo)), ts3, ctx, pts2);
+    fn s5CaOutA(self: @This(), x: zml.Tensor, tstab: zml.Tensor, tidx: zml.Tensor, ctx: zml.Tensor, pts2: zml.Tensor, cos: zml.Tensor, sin: zml.Tensor, comptime algo: Algo) zml.Tensor {
+        return self.caOut(rmsNoW(self.afterSa(x, tstab, tidx, cos, sin, algo)), tstab, tidx, ctx, pts2);
     }
 
-    pub fn s5CaOut(self: @This(), x: zml.Tensor, ts3: zml.Tensor, ctx: zml.Tensor, pts2: zml.Tensor, cos: zml.Tensor, sin: zml.Tensor) zml.Tensor {
-        return self.s5CaOutA(x, ts3, ctx, pts2, cos, sin, .dense);
+    pub fn s5CaOut(self: @This(), x: zml.Tensor, tstab: zml.Tensor, tidx: zml.Tensor, ctx: zml.Tensor, pts2: zml.Tensor, cos: zml.Tensor, sin: zml.Tensor) zml.Tensor {
+        return self.s5CaOutA(x, tstab, tidx, ctx, pts2, cos, sin, .dense);
     }
 
-    fn afterCa(self: @This(), x: zml.Tensor, ts3: zml.Tensor, ctx: zml.Tensor, pts2: zml.Tensor, cos: zml.Tensor, sin: zml.Tensor, comptime algo: Algo) zml.Tensor {
-        return self.afterSa(x, ts3, cos, sin, algo).add(self.s5CaOutA(x, ts3, ctx, pts2, cos, sin, algo));
+    fn afterCa(self: @This(), x: zml.Tensor, tstab: zml.Tensor, tidx: zml.Tensor, ctx: zml.Tensor, pts2: zml.Tensor, cos: zml.Tensor, sin: zml.Tensor, comptime algo: Algo) zml.Tensor {
+        return self.afterSa(x, tstab, tidx, cos, sin, algo).add(self.s5CaOutA(x, tstab, tidx, ctx, pts2, cos, sin, algo));
     }
 
-    fn s6FfInA(self: @This(), x: zml.Tensor, ts3: zml.Tensor, ctx: zml.Tensor, pts2: zml.Tensor, cos: zml.Tensor, sin: zml.Tensor, comptime algo: Algo) zml.Tensor {
-        const shift = adaVal(self.sst, ts3, 3);
-        const scl = adaVal(self.sst, ts3, 4);
-        return modulate(rmsNoW(self.afterCa(x, ts3, ctx, pts2, cos, sin, algo)), scl, shift);
+    fn s6FfInA(self: @This(), x: zml.Tensor, tstab: zml.Tensor, tidx: zml.Tensor, ctx: zml.Tensor, pts2: zml.Tensor, cos: zml.Tensor, sin: zml.Tensor, comptime algo: Algo) zml.Tensor {
+        const shift = adaVal(self.sst, tstab, tidx, 3);
+        const scl = adaVal(self.sst, tstab, tidx, 4);
+        return modulate(rmsNoW(self.afterCa(x, tstab, tidx, ctx, pts2, cos, sin, algo)), scl, shift);
     }
 
-    pub fn s6FfIn(self: @This(), x: zml.Tensor, ts3: zml.Tensor, ctx: zml.Tensor, pts2: zml.Tensor, cos: zml.Tensor, sin: zml.Tensor) zml.Tensor {
-        return self.s6FfInA(x, ts3, ctx, pts2, cos, sin, .dense);
+    pub fn s6FfIn(self: @This(), x: zml.Tensor, tstab: zml.Tensor, tidx: zml.Tensor, ctx: zml.Tensor, pts2: zml.Tensor, cos: zml.Tensor, sin: zml.Tensor) zml.Tensor {
+        return self.s6FfInA(x, tstab, tidx, ctx, pts2, cos, sin, .dense);
     }
 
-    fn s7FfOutA(self: @This(), x: zml.Tensor, ts3: zml.Tensor, ctx: zml.Tensor, pts2: zml.Tensor, cos: zml.Tensor, sin: zml.Tensor, comptime algo: Algo) zml.Tensor {
-        const ff_in = self.s6FfInA(x, ts3, ctx, pts2, cos, sin, algo);
+    fn s7FfOutA(self: @This(), x: zml.Tensor, tstab: zml.Tensor, tidx: zml.Tensor, ctx: zml.Tensor, pts2: zml.Tensor, cos: zml.Tensor, sin: zml.Tensor, comptime algo: Algo) zml.Tensor {
+        const ff_in = self.s6FfInA(x, tstab, tidx, ctx, pts2, cos, sin, algo);
         const h = lin(ff_in, self.ff1_w, null).gelu();
         return lin(h, self.ff2_w, null);
     }
 
-    pub fn s7FfOut(self: @This(), x: zml.Tensor, ts3: zml.Tensor, ctx: zml.Tensor, pts2: zml.Tensor, cos: zml.Tensor, sin: zml.Tensor) zml.Tensor {
-        return self.s7FfOutA(x, ts3, ctx, pts2, cos, sin, .dense);
+    pub fn s7FfOut(self: @This(), x: zml.Tensor, tstab: zml.Tensor, tidx: zml.Tensor, ctx: zml.Tensor, pts2: zml.Tensor, cos: zml.Tensor, sin: zml.Tensor) zml.Tensor {
+        return self.s7FfOutA(x, tstab, tidx, ctx, pts2, cos, sin, .dense);
     }
 
-    fn blockOutA(self: @This(), x: zml.Tensor, ts3: zml.Tensor, ctx: zml.Tensor, pts2: zml.Tensor, cos: zml.Tensor, sin: zml.Tensor, comptime algo: Algo) zml.Tensor {
-        const gate = adaVal(self.sst, ts3, 5);
-        return self.afterCa(x, ts3, ctx, pts2, cos, sin, algo)
-            .add(self.s7FfOutA(x, ts3, ctx, pts2, cos, sin, algo).mul(gate));
+    fn blockOutA(self: @This(), x: zml.Tensor, tstab: zml.Tensor, tidx: zml.Tensor, ctx: zml.Tensor, pts2: zml.Tensor, cos: zml.Tensor, sin: zml.Tensor, comptime algo: Algo) zml.Tensor {
+        const gate = adaVal(self.sst, tstab, tidx, 5);
+        return self.afterCa(x, tstab, tidx, ctx, pts2, cos, sin, algo)
+            .add(self.s7FfOutA(x, tstab, tidx, ctx, pts2, cos, sin, algo).mul(gate));
     }
 
-    pub fn blockOut(self: @This(), x: zml.Tensor, ts3: zml.Tensor, ctx: zml.Tensor, pts2: zml.Tensor, cos: zml.Tensor, sin: zml.Tensor) zml.Tensor {
-        return self.blockOutA(x, ts3, ctx, pts2, cos, sin, .dense);
+    pub fn blockOut(self: @This(), x: zml.Tensor, tstab: zml.Tensor, tidx: zml.Tensor, ctx: zml.Tensor, pts2: zml.Tensor, cos: zml.Tensor, sin: zml.Tensor) zml.Tensor {
+        return self.blockOutA(x, tstab, tidx, ctx, pts2, cos, sin, .dense);
     }
 
     /// E3w swap: the whole block with while attention in attn1.
-    pub fn wBlockOut(self: @This(), x: zml.Tensor, ts3: zml.Tensor, ctx: zml.Tensor, pts2: zml.Tensor, cos: zml.Tensor, sin: zml.Tensor) zml.Tensor {
-        return self.blockOutA(x, ts3, ctx, pts2, cos, sin, .blockwise);
+    pub fn wBlockOut(self: @This(), x: zml.Tensor, tstab: zml.Tensor, tidx: zml.Tensor, ctx: zml.Tensor, pts2: zml.Tensor, cos: zml.Tensor, sin: zml.Tensor) zml.Tensor {
+        return self.blockOutA(x, tstab, tidx, ctx, pts2, cos, sin, .blockwise);
     }
 
     /// f32 attn1 pre-softmax logits — probe 1's baseline for the int4 rung.
-    pub fn fLogits(self: @This(), x: zml.Tensor, ts3: zml.Tensor, cos: zml.Tensor, sin: zml.Tensor) zml.Tensor {
-        const n = self.s1NormMsa(x, ts3);
+    pub fn fLogits(self: @This(), x: zml.Tensor, tstab: zml.Tensor, tidx: zml.Tensor, cos: zml.Tensor, sin: zml.Tensor) zml.Tensor {
+        const n = self.s1NormMsa(x, tstab, tidx);
         const q = rmsW(lin(n, self.q1_w, self.q1_b), self.qn1);
         const k = rmsW(lin(n, self.k1_w, self.k1_b), self.kn1);
         const q4 = q.reshape(zml.Shape.init(.{ .q = q.dim(.t), .h = H, .p = 2, .f = 64 }, .f32));
@@ -417,19 +422,19 @@ pub const Chain = struct {
     b23: Block,
     b47: Block,
 
-    pub fn chainB23(self: @This(), x: zml.Tensor, ts3: zml.Tensor, ctx: zml.Tensor, pts2: zml.Tensor, cos: zml.Tensor, sin: zml.Tensor) zml.Tensor {
-        return self.b23.blockOut(self.b0.blockOut(x, ts3, ctx, pts2, cos, sin), ts3, ctx, pts2, cos, sin);
+    pub fn chainB23(self: @This(), x: zml.Tensor, tstab: zml.Tensor, tidx: zml.Tensor, ctx: zml.Tensor, pts2: zml.Tensor, cos: zml.Tensor, sin: zml.Tensor) zml.Tensor {
+        return self.b23.blockOut(self.b0.blockOut(x, tstab, tidx, ctx, pts2, cos, sin), tstab, tidx, ctx, pts2, cos, sin);
     }
 
-    pub fn chainB47(self: @This(), x: zml.Tensor, ts3: zml.Tensor, ctx: zml.Tensor, pts2: zml.Tensor, cos: zml.Tensor, sin: zml.Tensor) zml.Tensor {
-        return self.b47.blockOut(self.chainB23(x, ts3, ctx, pts2, cos, sin), ts3, ctx, pts2, cos, sin);
+    pub fn chainB47(self: @This(), x: zml.Tensor, tstab: zml.Tensor, tidx: zml.Tensor, ctx: zml.Tensor, pts2: zml.Tensor, cos: zml.Tensor, sin: zml.Tensor) zml.Tensor {
+        return self.b47.blockOut(self.chainB23(x, tstab, tidx, ctx, pts2, cos, sin), tstab, tidx, ctx, pts2, cos, sin);
     }
 
     /// E3w compounding probe: while attention in all three blocks.
-    pub fn wChainB47(self: @This(), x: zml.Tensor, ts3: zml.Tensor, ctx: zml.Tensor, pts2: zml.Tensor, cos: zml.Tensor, sin: zml.Tensor) zml.Tensor {
-        const y0 = self.b0.wBlockOut(x, ts3, ctx, pts2, cos, sin);
-        const y23 = self.b23.wBlockOut(y0, ts3, ctx, pts2, cos, sin);
-        return self.b47.wBlockOut(y23, ts3, ctx, pts2, cos, sin);
+    pub fn wChainB47(self: @This(), x: zml.Tensor, tstab: zml.Tensor, tidx: zml.Tensor, ctx: zml.Tensor, pts2: zml.Tensor, cos: zml.Tensor, sin: zml.Tensor) zml.Tensor {
+        const y0 = self.b0.wBlockOut(x, tstab, tidx, ctx, pts2, cos, sin);
+        const y23 = self.b23.wBlockOut(y0, tstab, tidx, ctx, pts2, cos, sin);
+        return self.b47.wBlockOut(y23, tstab, tidx, ctx, pts2, cos, sin);
     }
 };
 
@@ -489,15 +494,15 @@ pub const QBlock = struct {
 
     /// Probe 1: attn1 pre-softmax logits, int4 q/k. Compared against the
     /// f32 twin so softmax amplification is separable from projection error.
-    pub fn qLogits(self: @This(), x: zml.Tensor, ts3: zml.Tensor, cos: zml.Tensor, sin: zml.Tensor) zml.Tensor {
-        const n = self.base.s1NormMsa(x, ts3);
+    pub fn qLogits(self: @This(), x: zml.Tensor, tstab: zml.Tensor, tidx: zml.Tensor, cos: zml.Tensor, sin: zml.Tensor) zml.Tensor {
+        const n = self.base.s1NormMsa(x, tstab, tidx);
         const qk = self.qkRoped(n, cos, sin);
         return qk.q3.dot(qk.k3, .hd);
     }
 
     /// Probe 2: full gated attn1 with int4 q/k/v.
-    pub fn qAttn1(self: @This(), x: zml.Tensor, ts3: zml.Tensor, cos: zml.Tensor, sin: zml.Tensor) zml.Tensor {
-        const n = self.base.s1NormMsa(x, ts3);
+    pub fn qAttn1(self: @This(), x: zml.Tensor, tstab: zml.Tensor, tidx: zml.Tensor, cos: zml.Tensor, sin: zml.Tensor) zml.Tensor {
+        const n = self.base.s1NormMsa(x, tstab, tidx);
         const qk = self.qkRoped(n, cos, sin);
         const v = linQ(n, self.v1q, self.v1s, self.base.v1_b);
         const v3 = v.reshape(zml.Shape.init(.{ .k = v.dim(.t), .h = H, .hd = HD }, .f32));
@@ -515,19 +520,19 @@ pub const QBlock = struct {
     /// FFN-isolated probe: the f32 path up to the REAL ff_in, then the
     /// quantized FFN — so the comparison against f32 s7FfOut sees only
     /// this class's error.
-    pub fn qFfOut(self: @This(), x: zml.Tensor, ts3: zml.Tensor, ctx: zml.Tensor, pts2: zml.Tensor, cos: zml.Tensor, sin: zml.Tensor) zml.Tensor {
-        return self.qFf(self.base.s6FfIn(x, ts3, ctx, pts2, cos, sin));
+    pub fn qFfOut(self: @This(), x: zml.Tensor, tstab: zml.Tensor, tidx: zml.Tensor, ctx: zml.Tensor, pts2: zml.Tensor, cos: zml.Tensor, sin: zml.Tensor) zml.Tensor {
+        return self.qFf(self.base.s6FfIn(x, tstab, tidx, ctx, pts2, cos, sin));
     }
 
     /// The whole block with quantized qkv AND quantized FFN.
-    pub fn qBlockOutAll(self: @This(), x: zml.Tensor, ts3: zml.Tensor, ctx: zml.Tensor, pts2: zml.Tensor, cos: zml.Tensor, sin: zml.Tensor) zml.Tensor {
+    pub fn qBlockOutAll(self: @This(), x: zml.Tensor, tstab: zml.Tensor, tidx: zml.Tensor, ctx: zml.Tensor, pts2: zml.Tensor, cos: zml.Tensor, sin: zml.Tensor) zml.Tensor {
         const b = self.base;
-        const gate_msa = adaVal(b.sst, ts3, 2);
-        const x_sa = x.add(self.qAttn1(x, ts3, cos, sin).mul(gate_msa));
+        const gate_msa = adaVal(b.sst, tstab, tidx, 2);
+        const x_sa = x.add(self.qAttn1(x, tstab, tidx, cos, sin).mul(gate_msa));
         const x_normed = rmsNoW(x_sa);
-        const shift_q = adaVal(b.sst, ts3, 6);
-        const scale_q = adaVal(b.sst, ts3, 7);
-        const gate_ca = adaVal(b.sst, ts3, 8);
+        const shift_q = adaVal(b.sst, tstab, tidx, 6);
+        const scale_q = adaVal(b.sst, tstab, tidx, 7);
+        const gate_ca = adaVal(b.sst, tstab, tidx, 8);
         const attn_in = modulate(x_normed, scale_q, shift_q);
         const kv = b.psst.convert(.f32).add(pts2);
         const shift_kv = kv.slice1d(.n, .{ .start = 0, .end = 1 }).squeeze(.n);
@@ -545,23 +550,23 @@ pub const QBlock = struct {
         const merged = ca.transpose(.{ .q, .h, .hd }).reshape(zml.Shape.init(.{ .t = attn_in.dim(.t), .i = D }, .f32));
         const ca_out = lin(merged, b.o2_w, b.o2_b).mul(gate_ca);
         const x_ca = x_sa.add(ca_out);
-        const shift_mlp = adaVal(b.sst, ts3, 3);
-        const scale_mlp = adaVal(b.sst, ts3, 4);
-        const gate_mlp = adaVal(b.sst, ts3, 5);
+        const shift_mlp = adaVal(b.sst, tstab, tidx, 3);
+        const scale_mlp = adaVal(b.sst, tstab, tidx, 4);
+        const gate_mlp = adaVal(b.sst, tstab, tidx, 5);
         const ff_in = modulate(rmsNoW(x_ca), scale_mlp, shift_mlp);
         return x_ca.add(self.qFf(ff_in).mul(gate_mlp));
     }
 
     /// Probe 3: the whole block with int4 qkv in BOTH attentions.
-    pub fn qBlockOut(self: @This(), x: zml.Tensor, ts3: zml.Tensor, ctx: zml.Tensor, pts2: zml.Tensor, cos: zml.Tensor, sin: zml.Tensor) zml.Tensor {
+    pub fn qBlockOut(self: @This(), x: zml.Tensor, tstab: zml.Tensor, tidx: zml.Tensor, ctx: zml.Tensor, pts2: zml.Tensor, cos: zml.Tensor, sin: zml.Tensor) zml.Tensor {
         const b = self.base;
-        const gate_msa = adaVal(b.sst, ts3, 2);
-        const x_sa = x.add(self.qAttn1(x, ts3, cos, sin).mul(gate_msa));
+        const gate_msa = adaVal(b.sst, tstab, tidx, 2);
+        const x_sa = x.add(self.qAttn1(x, tstab, tidx, cos, sin).mul(gate_msa));
         const x_normed = rmsNoW(x_sa);
         // cross-attention with int4 q/k/v
-        const shift_q = adaVal(b.sst, ts3, 6);
-        const scale_q = adaVal(b.sst, ts3, 7);
-        const gate_ca = adaVal(b.sst, ts3, 8);
+        const shift_q = adaVal(b.sst, tstab, tidx, 6);
+        const scale_q = adaVal(b.sst, tstab, tidx, 7);
+        const gate_ca = adaVal(b.sst, tstab, tidx, 8);
         const attn_in = modulate(x_normed, scale_q, shift_q);
         const kv = b.psst.convert(.f32).add(pts2);
         const shift_kv = kv.slice1d(.n, .{ .start = 0, .end = 1 }).squeeze(.n);
@@ -580,9 +585,9 @@ pub const QBlock = struct {
         const ca_out = lin(merged, b.o2_w, b.o2_b).mul(gate_ca);
         const x_ca = x_sa.add(ca_out);
         // ffn (f32 this rung)
-        const shift_mlp = adaVal(b.sst, ts3, 3);
-        const scale_mlp = adaVal(b.sst, ts3, 4);
-        const gate_mlp = adaVal(b.sst, ts3, 5);
+        const shift_mlp = adaVal(b.sst, tstab, tidx, 3);
+        const scale_mlp = adaVal(b.sst, tstab, tidx, 4);
+        const gate_mlp = adaVal(b.sst, tstab, tidx, 5);
         const ff_in = modulate(rmsNoW(x_ca), scale_mlp, shift_mlp);
         const ff_out = lin(lin(ff_in, b.ff1_w, null).gelu(), b.ff2_w, null);
         return x_ca.add(ff_out.mul(gate_mlp));
